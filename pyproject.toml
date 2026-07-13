@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bb-orchestrator"
+version = "0.1.0"
+description = "MVP local e seguro para orquestração de bug bounty autorizado"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.9,<3",
+    "sqlalchemy>=2.0,<3",
+    "typer>=0.12,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<10",
+    "ruff>=0.9,<1",
+]
+
+[project.scripts]
+bb = "bb_orchestrator.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bb_orchestrator"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
+
