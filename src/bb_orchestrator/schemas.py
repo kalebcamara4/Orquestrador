@@ -50,6 +50,12 @@ class DnsStatus(StrEnum):
     UNRESOLVED = "unresolved"
 
 
+class HttpReachability(StrEnum):
+    PENDING = "pending"
+    REACHABLE = "reachable"
+    UNREACHABLE = "unreachable"
+
+
 class Schema(BaseModel):
     model_config = ConfigDict(extra="forbid", from_attributes=True)
 

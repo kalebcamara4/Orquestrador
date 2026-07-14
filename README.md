@@ -2,8 +2,9 @@
 
 CLI local para organizar ativos de programas de bug bounty **explicitamente autorizados**.
 O fluxo começa com descoberta passiva e aprovação humana obrigatória. Depois da aprovação,
-esta etapa permite a primeira verificação ativa: uma resolução DNS mínima com `dnsx`. Nenhum
-comando faz HTTP, crawling, port scan, fuzzing, nuclei ou integração com modelos de linguagem.
+ele permite três verificações ativas mínimas: resolução DNS com `dnsx`, consulta HTTP raiz com
+`httpx` e quatro portas TCP fixas com `naabu`. Não há crawling, fuzzing, nuclei ou integração com
+modelos de linguagem.
 
 ## Requisitos
 
@@ -11,6 +12,10 @@ comando faz HTTP, crawling, port scan, fuzzing, nuclei ou integração com model
 - Python 3.12 ou superior
 - `subfinder` no `PATH` (opcional; necessário somente para `recon passive --confirm`)
 - `dnsx` no `PATH` (opcional; necessário somente para `verify dns <run-id> --confirm`)
+- ProjectDiscovery `httpx` no `PATH` (opcional; necessário somente para
+  `verify http <run-id> --confirm`)
+- ProjectDiscovery `naabu` no `PATH` (opcional; necessário somente para
+  `verify ports <run-id> --confirm`)
 - VS Code (opcional)
 
 ## Instalação
@@ -71,7 +76,7 @@ bb program select
 
 Arquivar retira o programa do seletor e limpa a seleção se ele estiver ativo, mas nunca apaga seu
 banco nem seus artefatos. Sem programa ativo, comandos como `scope`, `recon`, `run`, `candidates`,
-`verify`, `assets`, `sanitize`, `queue` e `triage` recusam a operação com:
+`policy`, `verify`, `ports`, `assets`, `sanitize`, `queue` e `triage` recusam a operação com:
 
 ```text
 Nenhum programa selecionado. Execute: bb program select
@@ -84,8 +89,27 @@ O fluxo seguro é:
 
 ```text
 scope import → recon passivo → candidatos em escopo → aprovação humana
-             → verificação DNS → assets list/export → sanitize → fila → triage --dry-run
+             → verificação DNS → verificação HTTP → verificação de portas
+             → assets list/export
+             → sanitize → fila → triage --dry-run
 ```
+
+### Política de execução do programa
+
+Todo programa começa com a política tipada `conservative`. Nesta versão ela é o único perfil
+disponível e não há argumentos livres para as ferramentas externas:
+
+```bash
+bb policy list
+bb policy show
+bb policy set conservative
+```
+
+DNS mantém 5 threads e 5 consultas/s. HTTP usa 2 threads, 2 req/s, timeout de 10 segundos e zero
+retries. Portas usa 2 workers, 4 pacotes/s, timeout de 1000 ms, zero retries, TCP CONNECT e somente
+`80,443,8080,8443`. Todo dry-run de verificação mostra nome, versão e parâmetros efetivos. Cada
+confirmação cria no SQLite um snapshot independente com somente nome, versão e parâmetros da
+etapa; atualizações futuras da definição não reescrevem o histórico.
 
 ### 1. Importe o escopo autorizado
 
@@ -218,6 +242,87 @@ bb assets list 1
 Esse comando mostra `host`, estado de aprovação e estado DNS. Um candidato ainda não verificado
 aparece como DNS `pending`. Esta etapa não altera o comportamento de `assets export`, `sanitize`
 ou `triage`.
+
+### 3B. Faça uma verificação HTTP mínima
+
+Somente candidatos aprovados cujo registro DNS mais recente seja `resolved` podem entrar nesta
+etapa. Confira o plano sem executar subprocessos, gravar a entrada ou usar a rede:
+
+```bash
+bb verify http 1 --dry-run
+```
+
+O plano mostra a quantidade elegível, 2 threads, limite de 2 requisições por segundo, timeout de
+10 segundos, uma única tentativa e o comando completo. Para autorizar explicitamente a consulta:
+
+```bash
+bb verify http 1 --confirm
+```
+
+A confirmação executa **somente** o ProjectDiscovery `httpx`. A lista contém apenas hostnames e o
+único caminho consultado é `/`. O comando usa JSONL silencioso em memória, omite body, desabilita
+o update check e o stdin, e define `-retries 0` porque essa flag conta repetições além da primeira
+tentativa:
+
+```text
+httpx -l .bb/programs/<slug>/runs/<run-id>/http/input-hosts.txt -json -silent -probe
+      -sc -title -td -ob -t 2 -rl 2 -timeout 10 -retries 0 -path /
+      -config /dev/null -duc -no-stdin
+```
+
+Não são usadas flags para seguir redirects, testar todos os IPs, escolher portas, enviar headers
+ou body customizados, capturar screenshots, favicon ou JARM, consultar ASN, fazer TLS probe,
+crawling ou adicionar outros paths. Respostas 200, redirects, 401, 403 e 404 são `reachable`;
+ausência de uma resposta HTTP válida é `unreachable`.
+
+O JSONL bruto do `httpx` nunca é salvo. Ele é processado somente em memória e reduzido a host,
+status code, reachability e, opcionalmente, título e tecnologias. Títulos têm limite de 200
+caracteres; tecnologias têm até 20 itens de 80 caracteres. Caracteres de controle são removidos.
+Campos com URL, IP, porta, token, e-mail, telefone ou outro padrão proibido são descartados por um
+gate default-deny. Headers, cookies, body, resposta raw, query strings e redirect location nunca
+são persistidos nem mostrados.
+
+A única gravação em disco fora do SQLite é a entrada determinística:
+
+```text
+.bb/programs/<slug>/runs/<run-id>/http/input-hosts.txt
+```
+
+Cada confirmação cria uma nova tentativa HTTP por host e preserva o histórico. `bb assets list 1`
+mostra os últimos estados DNS e HTTP e o status code; hosts ainda não verificados aparecem como
+HTTP `pending` e status `-`. A etapa continua sem alterar `assets export`, `sanitize` ou `triage`.
+Se `httpx` não estiver no `PATH`, a CLI pede instalação manual e não instala nada.
+
+### 3C. Verifique quatro portas TCP com Naabu
+
+Somente candidatos do programa ativo que continuem `approved`, cujo DNS mais recente seja
+`resolved` e cujo HTTP mais recente seja `reachable` são elegíveis:
+
+```bash
+bb verify ports 1 --dry-run
+bb verify ports 1 --confirm
+bb ports list 1
+```
+
+O dry-run não consulta o `PATH`, não cria arquivos, não inicia subprocessos e não usa rede. A
+confirmação exige `naabu` já instalado e executa uma lista fixa de argumentos: TCP CONNECT,
+2 workers, 4 pacotes/s, timeout de 1000 ms, zero retries e portas `80,443,8080,8443`. Update check,
+stdin e configuração do usuário ficam desabilitados. Não são habilitados SYN/raw socket, UDP,
+ranges, top ports, full scan, scan-all-ips, host discovery, reverse DNS, passive APIs, proxy, Nmap,
+service discovery, debug ou verbose.
+
+Os únicos arquivos são:
+
+```text
+.bb/programs/<slug>/runs/<run-id>/ports/input-hosts.txt
+.bb/programs/<slug>/runs/<run-id>/ports/ports.jsonl
+```
+
+O stdout JSONL é tratado como não confiável. Somente pares únicos de hostname elegível e porta
+permitida são persistidos. IPs, banners, ASN, payloads e saídas brutas nunca entram no banco, no
+JSONL seguro ou na CLI. `ports.jsonl` contém somente host, porta, estado `open`, timestamp, versão
+do Naabu, run e referência ao snapshot da política. `bb ports list` exibe apenas `HOST`, `PORTA` e
+`STATUS`.
 
 ### 4. Exporte os assets aprovados
 
@@ -356,11 +461,13 @@ Cada programa usa exclusivamente `.bb/programs/<slug>/orchestrator.db`. Fechar o
 apaga regras, runs, candidatos, assets ou itens da fila, e trocar a seleção não mistura dados entre
 programas. O arquivo `.bb/current-program.json` contém somente o slug atualmente selecionado.
 
-As tabelas incluem `programs`, `scope_rules`, `runs`, `candidates`,
-`dns_verification_attempts`, `assets` e `queue_items`. Cada banco armazena apenas os metadados e
-dados daquele programa: regras, hosts normalizados, fonte, estados, timestamps, contadores,
-referências e hashes SHA-256. O conteúdo bruto e o caminho do JSONL manual não são persistidos.
-As saídas seguras do subfinder e do dnsx existem somente no diretório `runs/` do programa ativo.
+As tabelas incluem `programs`, `program_policies`, `execution_policy_snapshots`, `scope_rules`,
+`runs`, `candidates`, `dns_verification_attempts`, `http_verification_attempts`,
+`port_observations`, `assets` e `queue_items`. Cada banco
+armazena apenas os metadados e dados daquele programa: regras, hosts normalizados, fonte, estados,
+timestamps, contadores, referências e hashes SHA-256. O conteúdo bruto e o caminho do JSONL
+manual não são persistidos. As saídas reduzidas e entradas seguras existem somente no diretório
+`runs/` do programa ativo; não há saída DNS, HTTP ou Naabu bruta em disco.
 
 Não coloque API keys em código, arquivos JSON/JSONL ou SQLite. O orquestrador não lê, grava ou
 gerencia credenciais de provedores do subfinder.
@@ -387,7 +494,10 @@ ruff format .
 - Sem LLMs, LiteLLM, DeepSeek ou GPT-OSS.
 - Sem GUI, servidor web ou Docker.
 - A única descoberta automática é o subfinder passivo, após `--confirm`.
-- A única verificação ativa é o dnsx limitado a 5 threads e 5 DNS/s, após aprovação humana e
-  `verify dns <run-id> --confirm`.
-- Sem httpx, port scan, crawler, ffuf, nuclei ou tráfego HTTP contra os hosts descobertos.
+- A verificação DNS usa somente dnsx, com 5 threads e 5 DNS/s, após aprovação humana.
+- A verificação HTTP usa somente httpx, com 2 threads, 2 req/s, raiz, timeout de 10 segundos e sem
+  redirects, somente após o DNS mais recente estar `resolved`.
+- A verificação de portas usa somente Naabu em TCP CONNECT, nas quatro portas fixas, após HTTP
+  `reachable` e sempre com `--confirm`.
+- Sem ranges/full scan, UDP, SYN/raw socket, Nmap, crawler, ffuf, nuclei ou paths HTTP adicionais.
 - Sem processamento de requisições/respostas HTTP brutas ou segredos.

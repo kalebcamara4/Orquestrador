@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import shutil
 import subprocess
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,6 +20,7 @@ from pydantic import ValidationError
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
+from bb_orchestrator.adapters import DEFAULT_SUBPROCESS_ADAPTER, SubprocessAdapter
 from bb_orchestrator.domain import (
     InvalidDomain,
     ScopeKind,
@@ -29,14 +32,26 @@ from bb_orchestrator.models import (
     AssetModel,
     CandidateModel,
     DnsVerificationAttemptModel,
+    HttpVerificationAttemptModel,
+    PortObservationModel,
     QueueItemModel,
     RunModel,
     ScopeRuleModel,
+)
+from bb_orchestrator.policies import (
+    DnsParameters,
+    ExecutionPolicy,
+    HttpParameters,
+    PolicyError,
+    PortParameters,
+    get_program_policy,
+    persist_policy_snapshot,
 )
 from bb_orchestrator.schemas import (
     AssetStatus,
     CandidateStatus,
     DnsStatus,
+    HttpReachability,
     IngestRecord,
     QueueStatus,
     RunStatus,
@@ -50,9 +65,19 @@ DEFAULT_TRIAGE_BATCH_SIZE = 10
 MAX_TRIAGE_BATCH_SIZE = 20
 DEFAULT_RUNS_PATH = Path("runs")
 SUBFINDER_TIMEOUT_SECONDS = 300
-DNSX_TIMEOUT_SECONDS = 300
-DNSX_THREADS = 5
-DNSX_RATE_LIMIT = 5
+HTTP_TITLE_MAX_LENGTH = 200
+HTTP_TECHNOLOGY_MAX_LENGTH = 80
+HTTP_TECHNOLOGIES_MAX_COUNT = 20
+
+_HTTPX_BLOCKED_ENVIRONMENT = frozenset(
+    {
+        "ALL_PROXY",
+        "ENABLE_CLOUD_UPLOAD",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+    }
+)
 
 _URL_PATTERN = re.compile(r"(?i)(?:\b[a-z][a-z0-9+.-]{1,20}://|\b(?:[a-z0-9-]+\.)+[a-z]{2,63}/\S*)")
 _QUERY_PATTERN = re.compile(r"(?i)(?:\?|%3f|(?:^|&)\s*[^&=\s]{1,64}=[^&\s]*)")
@@ -76,6 +101,19 @@ _PHONE_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:\+?\d[\s().-]*){8,15}(?![A-Za-z
 _CPF_PATTERN = re.compile(r"(?<![A-Za-z0-9])\d{3}\.?\d{3}\.?\d{3}-?\d{2}(?![A-Za-z0-9])")
 _IP_CANDIDATE_PATTERN = re.compile(r"(?<![A-Za-z0-9])[\[\]0-9A-Fa-f:.%]+(?![A-Za-z0-9])")
 _DNSX_VERSION_PATTERN = re.compile(r"(?i)\bversion\s*:?\s*(v?\d+\.\d+\.\d+)\b")
+_NAABU_VERSION_PATTERN = re.compile(
+    r"(?i)(?:\bversion\b[^0-9v]{0,20}|\bnaabu\s+)"
+    r"(v?\d+\.\d+(?:\.\d+)?)(?!\.)\b"
+)
+
+_NAABU_BLOCKED_ENVIRONMENT = frozenset(
+    {
+        "ALL_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+    }
+)
 
 
 class InputError(ValueError):
@@ -130,6 +168,9 @@ class DnsVerificationPlan:
     command: tuple[str, ...]
     input_path: Path
     resolved_path: Path
+    policy_name: str
+    policy_version: str
+    parameters: DnsParameters
 
 
 @dataclass(frozen=True)
@@ -143,10 +184,80 @@ class DnsVerificationResult:
 
 
 @dataclass(frozen=True)
+class HttpVerificationPlan:
+    host_count: int
+    threads: int
+    rate_limit: int
+    request_timeout: int
+    attempts: int
+    command: tuple[str, ...]
+    input_path: Path
+    policy_name: str
+    policy_version: str
+    parameters: HttpParameters
+
+
+@dataclass(frozen=True)
+class HttpVerificationResult:
+    attempted: int
+    reachable: int
+    unreachable: int
+    input_path: Path
+
+
+@dataclass(frozen=True)
+class PortVerificationPlan:
+    host_count: int
+    workers: int
+    rate_limit: int
+    timeout_milliseconds: int
+    retries: int
+    ports: tuple[int, ...]
+    scan_type: str
+    command: tuple[str, ...]
+    input_path: Path
+    output_path: Path
+    policy_name: str
+    policy_version: str
+    parameters: PortParameters
+
+
+@dataclass(frozen=True)
+class PortVerificationResult:
+    attempted: int
+    open_ports: int
+    input_path: Path
+    output_path: Path
+
+
+@dataclass(frozen=True)
+class OpenPort:
+    host: str
+    port: int
+    status: str
+
+
+@dataclass(frozen=True)
+class _ParsedOpenPort:
+    host: str
+    port: int
+
+
+@dataclass(frozen=True)
 class AssetDnsState:
     host: str
     approval_status: str
     dns_status: str
+    http_reachability: str
+    http_status_code: int | None
+
+
+@dataclass(frozen=True)
+class _HttpObservation:
+    reachability: str
+    status_code: int | None
+    title: str | None
+    technologies: list[str] | None
 
 
 class PolicyViolation(InputError):
@@ -658,7 +769,9 @@ def _dns_verification_plan(
     run_id: int,
     candidates: Sequence[CandidateModel],
     runs_path: Path,
+    policy: ExecutionPolicy,
 ) -> DnsVerificationPlan:
+    parameters = policy.dns
     dns_path = runs_path / str(run_id) / "dns"
     input_path = dns_path / "input-hosts.txt"
     resolved_path = dns_path / "resolved-hosts.txt"
@@ -668,17 +781,20 @@ def _dns_verification_plan(
         str(input_path),
         "-silent",
         "-t",
-        str(DNSX_THREADS),
+        str(parameters.threads),
         "-rl",
-        str(DNSX_RATE_LIMIT),
+        str(parameters.rate_limit_per_second),
     )
     return DnsVerificationPlan(
         host_count=len(candidates),
-        threads=DNSX_THREADS,
-        rate_limit=DNSX_RATE_LIMIT,
+        threads=parameters.threads,
+        rate_limit=parameters.rate_limit_per_second,
         command=command,
         input_path=input_path,
         resolved_path=resolved_path,
+        policy_name=policy.name.value,
+        policy_version=policy.version,
+        parameters=parameters,
     )
 
 
@@ -686,11 +802,16 @@ def plan_dns_verification(
     run_id: int,
     session: Session,
     *,
+    program_slug: str,
     runs_path: Path = DEFAULT_RUNS_PATH,
 ) -> DnsVerificationPlan:
     """Planeja a execução sem consultar binários, executar processos ou gravar arquivos."""
     candidates = _approved_dns_candidates(run_id, session)
-    return _dns_verification_plan(run_id, candidates, runs_path)
+    try:
+        policy = get_program_policy(session, program_slug=program_slug)
+    except PolicyError as exc:
+        raise InputError(str(exc)) from exc
+    return _dns_verification_plan(run_id, candidates, runs_path, policy)
 
 
 def _resolved_hosts_from_dnsx(stdout: str, approved_hosts: set[str]) -> list[str]:
@@ -719,7 +840,11 @@ def verify_dns(
 ) -> DnsVerificationResult:
     """Executa somente dnsx e persiste uma tentativa mínima por candidato aprovado."""
     candidates = _approved_dns_candidates(run_id, session)
-    plan = _dns_verification_plan(run_id, candidates, runs_path)
+    try:
+        policy = get_program_policy(session, program_slug=program_slug)
+    except PolicyError as exc:
+        raise InputError(str(exc)) from exc
+    plan = _dns_verification_plan(run_id, candidates, runs_path, policy)
     dnsx_path = shutil.which("dnsx")
     if dnsx_path is None:
         raise InputError(
@@ -743,6 +868,17 @@ def verify_dns(
         for candidate in candidates
     ]
     session.add_all(attempts)
+    try:
+        persist_policy_snapshot(
+            session,
+            run_id=run_id,
+            program_slug=program_slug,
+            step="dns",
+            policy=policy,
+        )
+    except PolicyError as exc:
+        session.rollback()
+        raise InputError(str(exc)) from exc
     session.commit()
 
     command = [dnsx_path, *plan.command[1:]]
@@ -756,7 +892,7 @@ def verify_dns(
             stdin=subprocess.DEVNULL,
             shell=False,
             text=True,
-            timeout=DNSX_TIMEOUT_SECONDS,
+            timeout=plan.parameters.process_timeout_seconds,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise InputError("não foi possível executar o dnsx") from exc
@@ -790,21 +926,12 @@ def verify_dns(
     )
 
 
-def list_assets_with_dns(
+def _latest_dns_attempts(
     run_id: int,
     session: Session,
     *,
     program_slug: str,
-) -> list[AssetDnsState]:
-    """Lista candidatos da run com o estado DNS mais recente, sem materializar assets."""
-    _require_run(run_id, session)
-    candidates = list(
-        session.scalars(
-            select(CandidateModel)
-            .where(CandidateModel.run_id == run_id)
-            .order_by(CandidateModel.host, CandidateModel.id)
-        )
-    )
+) -> dict[int, DnsVerificationAttemptModel]:
     latest_attempt_ids = (
         select(func.max(DnsVerificationAttemptModel.id))
         .where(
@@ -813,19 +940,693 @@ def list_assets_with_dns(
         )
         .group_by(DnsVerificationAttemptModel.candidate_id)
     )
-    latest_by_candidate = {
-        attempt.candidate_id: attempt.status
+    return {
+        attempt.candidate_id: attempt
         for attempt in session.scalars(
             select(DnsVerificationAttemptModel).where(
                 DnsVerificationAttemptModel.id.in_(latest_attempt_ids)
             )
         )
     }
+
+
+def _approved_resolved_http_candidates(
+    run_id: int,
+    session: Session,
+    *,
+    program_slug: str,
+) -> list[CandidateModel]:
+    _require_run(run_id, session)
+    patterns = _scope_patterns(session)
+    latest_dns = _latest_dns_attempts(run_id, session, program_slug=program_slug)
+    candidates = list(
+        session.scalars(
+            select(CandidateModel)
+            .where(
+                CandidateModel.run_id == run_id,
+                CandidateModel.status == CandidateStatus.APPROVED.value,
+            )
+            .order_by(CandidateModel.host, CandidateModel.id)
+        )
+    )
+    eligible = [
+        candidate
+        for candidate in candidates
+        if _is_safely_in_scope(candidate.host, patterns)
+        and candidate.id in latest_dns
+        and latest_dns[candidate.id].status == DnsStatus.RESOLVED.value
+    ]
+    if not eligible:
+        raise InputError(f"run {run_id} não possui candidatos aprovados com último DNS resolved")
+    return eligible
+
+
+def _http_verification_plan(
+    run_id: int,
+    candidates: Sequence[CandidateModel],
+    runs_path: Path,
+    policy: ExecutionPolicy,
+) -> HttpVerificationPlan:
+    parameters = policy.http
+    input_path = runs_path / str(run_id) / "http" / "input-hosts.txt"
+    command = (
+        "httpx",
+        "-l",
+        str(input_path),
+        "-json",
+        "-silent",
+        "-probe",
+        "-sc",
+        "-title",
+        "-td",
+        "-ob",
+        "-t",
+        str(parameters.threads),
+        "-rl",
+        str(parameters.rate_limit_per_second),
+        "-timeout",
+        str(parameters.timeout_seconds),
+        "-retries",
+        str(parameters.retries),
+        "-path",
+        "/",
+        "-config",
+        "/dev/null",
+        "-duc",
+        "-no-stdin",
+    )
+    return HttpVerificationPlan(
+        host_count=len(candidates),
+        threads=parameters.threads,
+        rate_limit=parameters.rate_limit_per_second,
+        request_timeout=parameters.timeout_seconds,
+        attempts=parameters.retries + 1,
+        command=command,
+        input_path=input_path,
+        policy_name=policy.name.value,
+        policy_version=policy.version,
+        parameters=parameters,
+    )
+
+
+def plan_http_verification(
+    run_id: int,
+    session: Session,
+    *,
+    program_slug: str,
+    runs_path: Path = DEFAULT_RUNS_PATH,
+) -> HttpVerificationPlan:
+    """Planeja o httpx sem consultar binários, executar processos ou gravar arquivos."""
+    candidates = _approved_resolved_http_candidates(
+        run_id,
+        session,
+        program_slug=program_slug,
+    )
+    try:
+        policy = get_program_policy(session, program_slug=program_slug)
+    except PolicyError as exc:
+        raise InputError(str(exc)) from exc
+    return _http_verification_plan(run_id, candidates, runs_path, policy)
+
+
+def _sanitize_http_text(value: Any, *, max_length: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    without_controls = "".join(
+        character for character in value if not unicodedata.category(character).startswith("C")
+    )
+    sanitized = " ".join(without_controls.split())
+    if not sanitized or len(sanitized) > max_length:
+        return None
+    if _forbidden_reason(sanitized) is not None:
+        return None
+    return sanitized
+
+
+def _sanitize_http_technologies(value: Any) -> list[str] | None:
+    if not isinstance(value, list) or not value or len(value) > HTTP_TECHNOLOGIES_MAX_COUNT:
+        return None
+    sanitized: list[str] = []
+    seen: set[str] = set()
+    for technology in value:
+        item = _sanitize_http_text(technology, max_length=HTTP_TECHNOLOGY_MAX_LENGTH)
+        if item is None:
+            return None
+        normalized_item = item.casefold()
+        if normalized_item not in seen:
+            seen.add(normalized_item)
+            sanitized.append(item)
+    return sorted(sanitized, key=str.casefold) or None
+
+
+def _http_observations(stdout: str, allowed_hosts: set[str]) -> dict[str, _HttpObservation]:
+    observations = {
+        host: _HttpObservation(
+            reachability=HttpReachability.UNREACHABLE.value,
+            status_code=None,
+            title=None,
+            technologies=None,
+        )
+        for host in allowed_hosts
+    }
+    for raw_line in stdout.splitlines():
+        try:
+            payload = json.loads(raw_line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        try:
+            host = normalize_domain(payload.get("input"))
+        except (InvalidDomain, TypeError, ValueError):
+            continue
+        if host not in allowed_hosts:
+            continue
+        status_code = payload.get("status_code")
+        if (
+            isinstance(status_code, bool)
+            or not isinstance(status_code, int)
+            or not 100 <= status_code <= 599
+            or observations[host].reachability == HttpReachability.REACHABLE.value
+        ):
+            continue
+        observations[host] = _HttpObservation(
+            reachability=HttpReachability.REACHABLE.value,
+            status_code=status_code,
+            title=_sanitize_http_text(payload.get("title"), max_length=HTTP_TITLE_MAX_LENGTH),
+            technologies=_sanitize_http_technologies(payload.get("tech")),
+        )
+    return observations
+
+
+def _httpx_environment() -> dict[str, str]:
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if name.upper() not in _HTTPX_BLOCKED_ENVIRONMENT
+        and not name.upper().startswith(("HTTPX_", "PDCP_"))
+    }
+
+
+def verify_http(
+    run_id: int,
+    session: Session,
+    *,
+    program_slug: str,
+    runs_path: Path = DEFAULT_RUNS_PATH,
+) -> HttpVerificationResult:
+    """Executa somente httpx e persiste metadados HTTP mínimos e sanitizados."""
+    candidates = _approved_resolved_http_candidates(
+        run_id,
+        session,
+        program_slug=program_slug,
+    )
+    try:
+        policy = get_program_policy(session, program_slug=program_slug)
+    except PolicyError as exc:
+        raise InputError(str(exc)) from exc
+    plan = _http_verification_plan(run_id, candidates, runs_path, policy)
+    httpx_path = shutil.which("httpx")
+    if httpx_path is None:
+        raise InputError(
+            "httpx não está instalado; instale-o manualmente e adicione o binário ao PATH"
+        )
+
+    input_content = "".join(f"{candidate.host}\n" for candidate in candidates)
+    _write_atomic(plan.input_path, input_content, "a lista de entrada do httpx")
+
+    started_at = datetime.now(UTC)
+    attempts = [
+        HttpVerificationAttemptModel(
+            run_id=run_id,
+            candidate_id=candidate.id,
+            program_slug=program_slug,
+            host=candidate.host,
+            reachability=HttpReachability.PENDING.value,
+            status_code=None,
+            title=None,
+            technologies=None,
+            verified_at=started_at,
+        )
+        for candidate in candidates
+    ]
+    session.add_all(attempts)
+    try:
+        persist_policy_snapshot(
+            session,
+            run_id=run_id,
+            program_slug=program_slug,
+            step="http",
+            policy=policy,
+        )
+    except PolicyError as exc:
+        session.rollback()
+        raise InputError(str(exc)) from exc
+    session.commit()
+
+    command = [httpx_path, *plan.command[1:]]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            check=False,
+            encoding="utf-8",
+            env=_httpx_environment(),
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            shell=False,
+            text=True,
+            timeout=plan.parameters.process_timeout_seconds,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise InputError("não foi possível executar o httpx") from exc
+
+    if completed.returncode != 0:
+        raise InputError(f"httpx terminou com código {completed.returncode}")
+
+    observations = _http_observations(
+        completed.stdout or "",
+        {candidate.host for candidate in candidates},
+    )
+    checked_at = datetime.now(UTC)
+    for attempt in attempts:
+        observation = observations[attempt.host]
+        attempt.reachability = observation.reachability
+        attempt.status_code = observation.status_code
+        attempt.title = observation.title
+        attempt.technologies = observation.technologies
+        attempt.verified_at = checked_at
+    session.commit()
+
+    reachable = sum(
+        attempt.reachability == HttpReachability.REACHABLE.value for attempt in attempts
+    )
+    return HttpVerificationResult(
+        attempted=len(attempts),
+        reachable=reachable,
+        unreachable=len(attempts) - reachable,
+        input_path=plan.input_path,
+    )
+
+
+def _latest_http_attempts(
+    run_id: int,
+    session: Session,
+    *,
+    program_slug: str,
+) -> dict[int, HttpVerificationAttemptModel]:
+    latest_attempt_ids = (
+        select(func.max(HttpVerificationAttemptModel.id))
+        .where(
+            HttpVerificationAttemptModel.run_id == run_id,
+            HttpVerificationAttemptModel.program_slug == program_slug,
+        )
+        .group_by(HttpVerificationAttemptModel.candidate_id)
+    )
+    return {
+        attempt.candidate_id: attempt
+        for attempt in session.scalars(
+            select(HttpVerificationAttemptModel).where(
+                HttpVerificationAttemptModel.id.in_(latest_attempt_ids)
+            )
+        )
+    }
+
+
+def _approved_resolved_reachable_port_candidates(
+    run_id: int,
+    session: Session,
+    *,
+    program_slug: str,
+) -> list[CandidateModel]:
+    _require_run(run_id, session)
+    patterns = _scope_patterns(session)
+    latest_dns = _latest_dns_attempts(run_id, session, program_slug=program_slug)
+    latest_http = _latest_http_attempts(run_id, session, program_slug=program_slug)
+    candidates = list(
+        session.scalars(
+            select(CandidateModel)
+            .where(
+                CandidateModel.run_id == run_id,
+                CandidateModel.status == CandidateStatus.APPROVED.value,
+            )
+            .order_by(CandidateModel.host, CandidateModel.id)
+        )
+    )
+    eligible = [
+        candidate
+        for candidate in candidates
+        if _is_safely_in_scope(candidate.host, patterns)
+        and candidate.id in latest_dns
+        and latest_dns[candidate.id].status == DnsStatus.RESOLVED.value
+        and candidate.id in latest_http
+        and latest_http[candidate.id].reachability == HttpReachability.REACHABLE.value
+    ]
+    if not eligible:
+        raise InputError(
+            f"run {run_id} não possui candidatos approved, DNS resolved e HTTP reachable"
+        )
+    return eligible
+
+
+def _port_verification_plan(
+    run_id: int,
+    candidates: Sequence[CandidateModel],
+    runs_path: Path,
+    policy: ExecutionPolicy,
+) -> PortVerificationPlan:
+    parameters = policy.ports
+    ports_path = runs_path / str(run_id) / "ports"
+    input_path = ports_path / "input-hosts.txt"
+    output_path = ports_path / "ports.jsonl"
+    command = (
+        "naabu",
+        "-l",
+        str(input_path),
+        "-p",
+        ",".join(str(port) for port in parameters.ports),
+        "-scan-type",
+        "c",
+        "-c",
+        str(parameters.workers),
+        "-rate",
+        str(parameters.rate_limit_per_second),
+        "-timeout",
+        str(parameters.timeout_milliseconds),
+        "-retries",
+        str(parameters.retries),
+        "-json",
+        "-silent",
+        "-no-color",
+        "-disable-update-check",
+        "-no-stdin",
+        "-config",
+        "/dev/null",
+    )
+    return PortVerificationPlan(
+        host_count=len(candidates),
+        workers=parameters.workers,
+        rate_limit=parameters.rate_limit_per_second,
+        timeout_milliseconds=parameters.timeout_milliseconds,
+        retries=parameters.retries,
+        ports=parameters.ports,
+        scan_type=parameters.scan_type,
+        command=command,
+        input_path=input_path,
+        output_path=output_path,
+        policy_name=policy.name.value,
+        policy_version=policy.version,
+        parameters=parameters,
+    )
+
+
+def plan_port_verification(
+    run_id: int,
+    session: Session,
+    *,
+    program_slug: str,
+    runs_path: Path = DEFAULT_RUNS_PATH,
+) -> PortVerificationPlan:
+    """Planeja o Naabu sem consultar PATH, criar arquivos, executar processo ou usar rede."""
+    candidates = _approved_resolved_reachable_port_candidates(
+        run_id,
+        session,
+        program_slug=program_slug,
+    )
+    try:
+        policy = get_program_policy(session, program_slug=program_slug)
+    except PolicyError as exc:
+        raise InputError(str(exc)) from exc
+    return _port_verification_plan(run_id, candidates, runs_path, policy)
+
+
+def _naabu_environment() -> dict[str, str]:
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if name.upper() not in _NAABU_BLOCKED_ENVIRONMENT
+        and name.upper() != "ENABLE_CLOUD_UPLOAD"
+        and not name.upper().startswith(("NAABU_", "PDCP_"))
+    }
+
+
+def _safe_subprocess_error(stderr: str, *, tool: str, returncode: int) -> str:
+    without_controls = "".join(
+        character
+        for character in stderr
+        if character in "\n\t" or not unicodedata.category(character).startswith("C")
+    )
+    lines = [" ".join(line.split()) for line in without_controls.splitlines() if line.strip()]
+    detail = lines[0][:160] if lines else "falha reportada pela ferramenta"
+    if _forbidden_reason(detail) is not None:
+        detail = "falha reportada pela ferramenta"
+    return f"{tool} falhou (código {returncode}): {detail}"
+
+
+def _naabu_version(
+    executable: str,
+    adapter: SubprocessAdapter,
+    *,
+    environment: dict[str, str],
+    timeout_seconds: int,
+) -> str:
+    command = (executable, "-version", "-disable-update-check", "-no-color")
+    try:
+        completed = adapter.run(
+            command,
+            timeout_seconds=timeout_seconds,
+            environment=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise InputError("não foi possível consultar a versão do naabu") from exc
+    if completed.returncode != 0:
+        raise InputError(
+            _safe_subprocess_error(
+                completed.stderr or "",
+                tool="naabu",
+                returncode=completed.returncode,
+            )
+        )
+    match = _NAABU_VERSION_PATTERN.search(f"{completed.stdout or ''}\n{completed.stderr or ''}")
+    if match is None:
+        raise InputError("naabu não informou uma versão válida")
+    version = match.group(1).lower()
+    if _contains_ip_address(version):
+        raise InputError("naabu não informou uma versão válida")
+    return version
+
+
+def _parse_naabu_output(
+    stdout: str,
+    *,
+    allowed_hosts: set[str],
+    allowed_ports: set[int],
+) -> list[_ParsedOpenPort]:
+    observations: set[tuple[str, int]] = set()
+    for raw_line in stdout.splitlines():
+        try:
+            payload = json.loads(raw_line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        try:
+            host = normalize_domain(payload.get("host"))
+        except (InvalidDomain, TypeError, ValueError):
+            continue
+        port = payload.get("port")
+        if (
+            host not in allowed_hosts
+            or isinstance(port, bool)
+            or not isinstance(port, int)
+            or port not in allowed_ports
+        ):
+            continue
+        observations.add((host, port))
+    return [_ParsedOpenPort(host=host, port=port) for host, port in sorted(observations)]
+
+
+def _port_jsonl_content(
+    run_id: int,
+    session: Session,
+) -> str:
+    records = session.scalars(
+        select(PortObservationModel)
+        .where(PortObservationModel.run_id == run_id)
+        .order_by(PortObservationModel.host, PortObservationModel.port)
+    )
+    lines: list[str] = []
+    for record in records:
+        timestamp = record.observed_at.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        payload = {
+            "host": record.host,
+            "port": record.port,
+            "status": record.status,
+            "timestamp": timestamp,
+            "tool_version": record.tool_version,
+            "run_id": record.run_id,
+            "policy_snapshot_id": record.policy_snapshot_id,
+        }
+        lines.append(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
+    return "".join(f"{line}\n" for line in lines)
+
+
+def verify_ports(
+    run_id: int,
+    session: Session,
+    *,
+    program_slug: str,
+    runs_path: Path = DEFAULT_RUNS_PATH,
+    adapter: SubprocessAdapter | None = None,
+) -> PortVerificationResult:
+    """Executa Naabu em TCP CONNECT e retém somente host e porta aberta permitidos."""
+    adapter = adapter or DEFAULT_SUBPROCESS_ADAPTER
+    candidates = _approved_resolved_reachable_port_candidates(
+        run_id,
+        session,
+        program_slug=program_slug,
+    )
+    try:
+        policy = get_program_policy(session, program_slug=program_slug)
+    except PolicyError as exc:
+        raise InputError(str(exc)) from exc
+    plan = _port_verification_plan(run_id, candidates, runs_path, policy)
+    executable = adapter.find_executable("naabu")
+    if executable is None:
+        raise InputError(
+            "naabu não está instalado; instale-o manualmente e adicione o binário ao PATH"
+        )
+
+    environment = _naabu_environment()
+    version = _naabu_version(
+        executable,
+        adapter,
+        environment=environment,
+        timeout_seconds=plan.parameters.process_timeout_seconds,
+    )
+    input_content = "".join(f"{candidate.host}\n" for candidate in candidates)
+    _write_atomic(plan.input_path, input_content, "a lista de entrada do naabu")
+    try:
+        snapshot = persist_policy_snapshot(
+            session,
+            run_id=run_id,
+            program_slug=program_slug,
+            step="ports",
+            policy=policy,
+        )
+    except PolicyError as exc:
+        session.rollback()
+        raise InputError(str(exc)) from exc
+    session.commit()
+
+    command = (executable, *plan.command[1:])
+    try:
+        completed = adapter.run(
+            command,
+            timeout_seconds=plan.parameters.process_timeout_seconds,
+            environment=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise InputError("não foi possível executar o naabu") from exc
+    if completed.returncode != 0:
+        raise InputError(
+            _safe_subprocess_error(
+                completed.stderr or "",
+                tool="naabu",
+                returncode=completed.returncode,
+            )
+        )
+
+    parsed = _parse_naabu_output(
+        completed.stdout or "",
+        allowed_hosts={candidate.host for candidate in candidates},
+        allowed_ports=set(plan.ports),
+    )
+    existing = {
+        (record.host, record.port)
+        for record in session.scalars(
+            select(PortObservationModel).where(PortObservationModel.run_id == run_id)
+        )
+    }
+    observed_at = datetime.now(UTC)
+    session.add_all(
+        PortObservationModel(
+            run_id=run_id,
+            host=observation.host,
+            port=observation.port,
+            status="open",
+            observed_at=observed_at,
+            tool_version=version,
+            policy_snapshot_id=snapshot.id,
+        )
+        for observation in parsed
+        if (observation.host, observation.port) not in existing
+    )
+    session.flush()
+    try:
+        _write_atomic(
+            plan.output_path,
+            _port_jsonl_content(run_id, session),
+            "ports.jsonl",
+        )
+    except InputError:
+        session.rollback()
+        raise
+    session.commit()
+    return PortVerificationResult(
+        attempted=len(candidates),
+        open_ports=len(parsed),
+        input_path=plan.input_path,
+        output_path=plan.output_path,
+    )
+
+
+def list_open_ports(run_id: int, session: Session) -> list[OpenPort]:
+    _require_run(run_id, session)
+    return [
+        OpenPort(host=record.host, port=record.port, status=record.status)
+        for record in session.scalars(
+            select(PortObservationModel)
+            .where(PortObservationModel.run_id == run_id)
+            .order_by(PortObservationModel.host, PortObservationModel.port)
+        )
+    ]
+
+
+def list_assets_with_dns(
+    run_id: int,
+    session: Session,
+    *,
+    program_slug: str,
+) -> list[AssetDnsState]:
+    """Lista candidatos com os estados DNS e HTTP mais recentes, sem materializar assets."""
+    _require_run(run_id, session)
+    candidates = list(
+        session.scalars(
+            select(CandidateModel)
+            .where(CandidateModel.run_id == run_id)
+            .order_by(CandidateModel.host, CandidateModel.id)
+        )
+    )
+    latest_dns = _latest_dns_attempts(run_id, session, program_slug=program_slug)
+    latest_http = _latest_http_attempts(run_id, session, program_slug=program_slug)
     return [
         AssetDnsState(
             host=candidate.host,
             approval_status=candidate.status,
-            dns_status=latest_by_candidate.get(candidate.id, DnsStatus.PENDING.value),
+            dns_status=(
+                latest_dns[candidate.id].status
+                if candidate.id in latest_dns
+                else DnsStatus.PENDING.value
+            ),
+            http_reachability=(
+                latest_http[candidate.id].reachability
+                if candidate.id in latest_http
+                else HttpReachability.PENDING.value
+            ),
+            http_status_code=(
+                latest_http[candidate.id].status_code if candidate.id in latest_http else None
+            ),
         )
         for candidate in candidates
     ]

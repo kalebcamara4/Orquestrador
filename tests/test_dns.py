@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 import bb_orchestrator.services as services
 from bb_orchestrator.cli import app
 from bb_orchestrator.database import create_session_factory, create_sqlite_engine
-from bb_orchestrator.models import DnsVerificationAttemptModel
+from bb_orchestrator.models import DnsVerificationAttemptModel, ExecutionPolicySnapshotModel
 from bb_orchestrator.programs import (
     NO_ACTIVE_PROGRAM_MESSAGE,
     create_program,
@@ -53,6 +53,16 @@ def _attempts(database_path: Path) -> list[DnsVerificationAttemptModel]:
         return list(
             session.scalars(
                 select(DnsVerificationAttemptModel).order_by(DnsVerificationAttemptModel.id)
+            )
+        )
+
+
+def _snapshots(database_path: Path) -> list[ExecutionPolicySnapshotModel]:
+    engine = create_sqlite_engine(database_path)
+    with create_session_factory(engine)() as session:
+        return list(
+            session.scalars(
+                select(ExecutionPolicySnapshotModel).order_by(ExecutionPolicySnapshotModel.id)
             )
         )
 
@@ -211,6 +221,19 @@ def test_dns_confirm_uses_only_approved_hosts_and_persists_minimal_results(
     assert {item.run_id for item in attempts} == {1}
     assert {item.dnsx_version for item in attempts} == {"v1.2.3"}
     assert all(item.verified_at is not None for item in attempts)
+    snapshots = _snapshots(Path(".bb/programs/test-program/orchestrator.db"))
+    assert [(item.run_id, item.program_slug, item.step) for item in snapshots] == [
+        (1, "test-program", "dns")
+    ]
+    assert snapshots[0].snapshot == {
+        "name": "conservative",
+        "version": "1",
+        "parameters": {
+            "threads": 5,
+            "rate_limit_per_second": 5,
+            "process_timeout_seconds": 300,
+        },
+    }
     serialized_values = "\n".join(
         str(value)
         for item in attempts

@@ -14,6 +14,13 @@ from bb_orchestrator.database import (
     create_sqlite_engine,
     initialize_database,
 )
+from bb_orchestrator.policies import (
+    PolicyError,
+    PolicyName,
+    available_policies,
+    get_program_policy,
+    set_program_policy,
+)
 from bb_orchestrator.programs import (
     ProgramError,
     archive_program,
@@ -33,14 +40,19 @@ from bb_orchestrator.services import (
     ingest_jsonl,
     list_assets_with_dns,
     list_candidates,
+    list_open_ports,
     list_queue,
     passive_recon_roots,
     plan_dns_verification,
+    plan_http_verification,
+    plan_port_verification,
     prepare_triage,
     reject_candidates,
     run_passive_recon,
     sanitize_run,
     verify_dns,
+    verify_http,
+    verify_ports,
 )
 
 app = typer.Typer(name="bb", help="Orquestrador local para bug bounty autorizado.")
@@ -52,6 +64,8 @@ candidates_app = typer.Typer(help="Gerencia a aprovação humana de candidatos."
 assets_app = typer.Typer(help="Consulta e exporta assets aprovados.")
 verify_app = typer.Typer(help="Executa verificações ativas estritamente limitadas.")
 program_app = typer.Typer(help="Gerencia programas isolados.")
+policy_app = typer.Typer(help="Gerencia políticas tipadas do programa ativo.")
+ports_app = typer.Typer(help="Consulta portas abertas verificadas com segurança.")
 app.add_typer(scope_app, name="scope")
 app.add_typer(run_app, name="run")
 app.add_typer(queue_app, name="queue")
@@ -60,6 +74,8 @@ app.add_typer(candidates_app, name="candidates")
 app.add_typer(assets_app, name="assets")
 app.add_typer(verify_app, name="verify")
 app.add_typer(program_app, name="program")
+app.add_typer(policy_app, name="policy")
+app.add_typer(ports_app, name="ports")
 
 InputFile = Annotated[
     Path,
@@ -182,6 +198,64 @@ def program_archive(slug: Annotated[str, typer.Argument()]) -> None:
     except ProgramError as exc:
         _abort(str(exc))
     typer.echo(f"Programa arquivado: {program.slug}")
+
+
+@policy_app.command("show")
+def policy_show() -> None:
+    """Mostra a política selecionada e todos os parâmetros tipados."""
+    session, program = _program_session()
+    with session:
+        try:
+            policy = get_program_policy(session, program_slug=program.slug)
+        except PolicyError as exc:
+            _abort(str(exc))
+    typer.echo(f"Política: {policy.name.value}")
+    typer.echo(f"Versão: {policy.version}")
+    typer.echo(
+        "DNS: "
+        f"threads={policy.dns.threads}; DNS/s={policy.dns.rate_limit_per_second}; "
+        f"timeout-processo={policy.dns.process_timeout_seconds}s"
+    )
+    typer.echo(
+        "HTTP: "
+        f"threads={policy.http.threads}; req/s={policy.http.rate_limit_per_second}; "
+        f"timeout={policy.http.timeout_seconds}s; retries={policy.http.retries}; "
+        f"timeout-processo={policy.http.process_timeout_seconds}s"
+    )
+    typer.echo(
+        "Portas: "
+        f"workers={policy.ports.workers}; pacotes/s={policy.ports.rate_limit_per_second}; "
+        f"timeout={policy.ports.timeout_milliseconds}ms; retries={policy.ports.retries}; "
+        f"portas={','.join(str(port) for port in policy.ports.ports)}; "
+        f"tipo={policy.ports.scan_type}"
+    )
+
+
+@policy_app.command("list")
+def policy_list() -> None:
+    """Lista exclusivamente os perfis implementados nesta versão."""
+    session, program = _program_session()
+    with session:
+        try:
+            selected = get_program_policy(session, program_slug=program.slug)
+        except PolicyError as exc:
+            _abort(str(exc))
+    typer.echo("ATIVA  POLÍTICA  VERSÃO")
+    for policy in available_policies():
+        marker = "*" if policy.name is selected.name else " "
+        typer.echo(f"{marker}  {policy.name.value}  {policy.version}")
+
+
+@policy_app.command("set")
+def policy_set(name: Annotated[PolicyName, typer.Argument()]) -> None:
+    """Seleciona uma política implementada para o programa ativo."""
+    session, program = _program_session()
+    with session:
+        try:
+            policy = set_program_policy(session, program_slug=program.slug, name=name)
+        except PolicyError as exc:
+            _abort(str(exc))
+    typer.echo(f"Política selecionada: {policy.name.value} (versão {policy.version}).")
 
 
 @scope_app.command("import")
@@ -319,7 +393,7 @@ def assets_export(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
 
 @assets_app.command("list")
 def assets_list(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
-    """Lista aprovação e último estado DNS de todos os candidatos da run."""
+    """Lista aprovação e os últimos estados DNS e HTTP dos candidatos."""
     session, program = _program_session()
     with session:
         try:
@@ -329,9 +403,13 @@ def assets_list(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
     if not assets:
         typer.echo("Nenhum candidato nesta run.")
         return
-    typer.echo("HOST  APROVAÇÃO  DNS")
+    typer.echo("HOST  APROVAÇÃO  DNS  HTTP  STATUS")
     for asset in assets:
-        typer.echo(f"{asset.host}  {asset.approval_status}  {asset.dns_status}")
+        status_code = asset.http_status_code if asset.http_status_code is not None else "-"
+        typer.echo(
+            f"{asset.host}  {asset.approval_status}  {asset.dns_status}  "
+            f"{asset.http_reachability}  {status_code}"
+        )
 
 
 @verify_app.command("dns")
@@ -353,9 +431,19 @@ def verify_dns_command(
             _abort("informe exatamente uma opção: --dry-run ou --confirm")
         try:
             if dry_run:
-                plan = plan_dns_verification(run_id, session, runs_path=program.runs_path)
+                plan = plan_dns_verification(
+                    run_id,
+                    session,
+                    program_slug=program.slug,
+                    runs_path=program.runs_path,
+                )
+                typer.echo(f"Política: {plan.policy_name}")
+                typer.echo(f"Versão da política: {plan.policy_version}")
                 typer.echo(f"Hosts aprovados: {plan.host_count}")
-                typer.echo(f"Limites: threads={plan.threads}; DNS/s={plan.rate_limit}")
+                typer.echo(
+                    f"Parâmetros efetivos: threads={plan.threads}; DNS/s={plan.rate_limit}; "
+                    f"timeout-processo={plan.parameters.process_timeout_seconds}s"
+                )
                 typer.echo(f"Comando planejado: {shlex.join(plan.command)}")
                 return
             result = verify_dns(
@@ -372,6 +460,121 @@ def verify_dns_command(
     )
     typer.echo(f"Entrada: {result.input_path}")
     typer.echo(f"Resolvidos: {result.resolved_path}")
+
+
+@verify_app.command("http")
+def verify_http_command(
+    run_id: Annotated[int, typer.Argument(min=1)],
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Mostra o plano sem subprocesso, arquivo ou rede."),
+    ] = False,
+    confirm: Annotated[
+        bool,
+        typer.Option("--confirm", help="Autoriza explicitamente a execução limitada do httpx."),
+    ] = False,
+) -> None:
+    """Verifica por HTTP somente aprovados cujo último DNS esteja resolved."""
+    session, program = _program_session()
+    with session:
+        if dry_run == confirm:
+            _abort("informe exatamente uma opção: --dry-run ou --confirm")
+        try:
+            if dry_run:
+                plan = plan_http_verification(
+                    run_id,
+                    session,
+                    program_slug=program.slug,
+                    runs_path=program.runs_path,
+                )
+                typer.echo(f"Política: {plan.policy_name}")
+                typer.echo(f"Versão da política: {plan.policy_version}")
+                typer.echo(f"Hosts aprovados e resolvidos: {plan.host_count}")
+                typer.echo(
+                    f"Parâmetros efetivos: threads={plan.threads}; req/s={plan.rate_limit}; "
+                    f"timeout={plan.request_timeout}s; tentativas={plan.attempts}; "
+                    f"retries={plan.parameters.retries}; "
+                    f"timeout-processo={plan.parameters.process_timeout_seconds}s"
+                )
+                typer.echo(f"Comando planejado: {shlex.join(plan.command)}")
+                return
+            result = verify_http(
+                run_id,
+                session,
+                program_slug=program.slug,
+                runs_path=program.runs_path,
+            )
+        except InputError as exc:
+            _abort(str(exc))
+    typer.echo(
+        f"Run {run_id}: verificados={result.attempted}, alcançáveis={result.reachable}, "
+        f"inalcançáveis={result.unreachable}."
+    )
+    typer.echo(f"Entrada: {result.input_path}")
+
+
+@verify_app.command("ports")
+def verify_ports_command(
+    run_id: Annotated[int, typer.Argument(min=1)],
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Mostra o plano sem subprocesso, arquivo ou rede."),
+    ] = False,
+    confirm: Annotated[
+        bool,
+        typer.Option("--confirm", help="Autoriza a execução TCP CONNECT limitada do Naabu."),
+    ] = False,
+) -> None:
+    """Verifica quatro portas fixas em aprovados, resolvidos e HTTP alcançáveis."""
+    session, program = _program_session()
+    with session:
+        if dry_run == confirm:
+            _abort("informe exatamente uma opção: --dry-run ou --confirm")
+        try:
+            if dry_run:
+                plan = plan_port_verification(
+                    run_id,
+                    session,
+                    program_slug=program.slug,
+                    runs_path=program.runs_path,
+                )
+                typer.echo(f"Política: {plan.policy_name}")
+                typer.echo(f"Versão da política: {plan.policy_version}")
+                typer.echo(f"Hosts elegíveis: {plan.host_count}")
+                typer.echo(
+                    f"Parâmetros efetivos: workers={plan.workers}; "
+                    f"pacotes/s={plan.rate_limit}; timeout={plan.timeout_milliseconds}ms; "
+                    f"retries={plan.retries}; portas="
+                    f"{','.join(str(port) for port in plan.ports)}; tipo={plan.scan_type}; "
+                    f"timeout-processo={plan.parameters.process_timeout_seconds}s"
+                )
+                typer.echo(f"Comando planejado: {shlex.join(plan.command)}")
+                return
+            result = verify_ports(
+                run_id,
+                session,
+                program_slug=program.slug,
+                runs_path=program.runs_path,
+            )
+        except InputError as exc:
+            _abort(str(exc))
+    typer.echo(f"Run {run_id}: verificados={result.attempted}, portas abertas={result.open_ports}.")
+
+
+@ports_app.command("list")
+def ports_list(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
+    """Lista somente host, porta e estado aberto da run no programa ativo."""
+    with _session(announce=False) as session:
+        try:
+            ports = list_open_ports(run_id, session)
+        except InputError as exc:
+            _abort(str(exc))
+    if not ports:
+        typer.echo("Nenhuma porta aberta.")
+        return
+    typer.echo("HOST  PORTA  STATUS")
+    for port in ports:
+        typer.echo(f"{port.host}  {port.port}  {port.status}")
 
 
 @app.command("sanitize")

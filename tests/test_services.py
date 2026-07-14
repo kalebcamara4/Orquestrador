@@ -29,13 +29,17 @@ def session(tmp_path: Path):
         yield db_session
 
 
-def test_database_contains_the_seven_corresponding_tables(tmp_path: Path) -> None:
+def test_database_contains_the_corresponding_tables(tmp_path: Path) -> None:
     engine = create_sqlite_engine(tmp_path / "tables.db")
     initialize_database(engine)
     assert set(inspect(engine).get_table_names()) == {
         "assets",
         "candidates",
         "dns_verification_attempts",
+        "execution_policy_snapshots",
+        "http_verification_attempts",
+        "port_observations",
+        "program_policies",
         "programs",
         "queue_items",
         "runs",
@@ -73,6 +77,26 @@ def test_dns_attempts_table_has_only_minimal_results_and_relations(tmp_path: Pat
         "status",
         "verified_at",
         "dnsx_version",
+    }
+
+
+def test_http_attempts_table_has_only_minimal_results_and_relations(tmp_path: Path) -> None:
+    engine = create_sqlite_engine(tmp_path / "http-columns.db")
+    initialize_database(engine)
+
+    assert {
+        column["name"] for column in inspect(engine).get_columns("http_verification_attempts")
+    } == {
+        "id",
+        "run_id",
+        "candidate_id",
+        "program_slug",
+        "host",
+        "reachability",
+        "status_code",
+        "title",
+        "technologies",
+        "verified_at",
     }
 
 

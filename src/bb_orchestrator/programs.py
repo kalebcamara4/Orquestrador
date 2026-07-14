@@ -16,7 +16,8 @@ from bb_orchestrator.database import (
     create_sqlite_engine,
     initialize_database,
 )
-from bb_orchestrator.models import ProgramModel
+from bb_orchestrator.models import ProgramModel, ProgramPolicyModel
+from bb_orchestrator.policies import DEFAULT_POLICY_NAME
 
 STATE_ROOT = Path(".bb")
 PROGRAMS_ROOT = STATE_ROOT / "programs"
@@ -129,6 +130,13 @@ def create_program(slug: str, name: str) -> ProgramInfo:
         with create_session_factory(engine)() as session:
             model = ProgramModel(slug=normalized_slug, name=normalized_name)
             session.add(model)
+            session.flush()
+            session.add(
+                ProgramPolicyModel(
+                    program_slug=normalized_slug,
+                    policy_name=DEFAULT_POLICY_NAME.value,
+                )
+            )
             session.commit()
             session.refresh(model)
             return _model_to_info(model)
