@@ -35,6 +35,51 @@ interpretador `.venv`, habilita a descoberta dos testes pytest e usa Ruff para f
 
 ## Uso passo a passo
 
+### Antes de começar: crie e selecione um programa
+
+Cada programa possui banco e artefatos próprios:
+
+```text
+.bb/
+├── current-program.json
+└── programs/<slug>/
+    ├── orchestrator.db
+    └── runs/
+```
+
+Crie um programa. Ao final, a CLI pergunta se ele deve ser selecionado:
+
+```bash
+bb program create acme --name "Acme Bug Bounty"
+```
+
+Gerencie e consulte os programas com:
+
+```bash
+bb program list
+bb program show
+bb program select acme
+bb program archive acme
+```
+
+`bb program select <slug>` é não interativo e apropriado para scripts. Sem o slug, o comando abre
+um seletor `questionary` com setas e `Enter`, mostrando somente programas não arquivados:
+
+```bash
+bb program select
+```
+
+Arquivar retira o programa do seletor e limpa a seleção se ele estiver ativo, mas nunca apaga seu
+banco nem seus artefatos. Sem programa ativo, comandos como `scope`, `recon`, `run`, `candidates`,
+`assets`, `sanitize`, `queue` e `triage` recusam a operação com:
+
+```text
+Nenhum programa selecionado. Execute: bb program select
+```
+
+Todo comando que usa dados mostra `Program: <slug>` e acessa exclusivamente o banco e o diretório
+`runs/` desse programa.
+
 O fluxo seguro é:
 
 ```text
@@ -90,7 +135,8 @@ resolução DNS, HTTP contra os hosts, port scan, crawler, ffuf, nuclei ou qualq
 Se o binário não estiver no `PATH`, a CLI explica que ele deve ser instalado manualmente e não
 tenta instalar nada.
 
-A saída anterior ao filtro de escopo fica em `runs/<run-id>/raw/subfinder.txt`. Por segurança,
+A saída anterior ao filtro de escopo fica em
+`.bb/programs/<slug>/runs/<run-id>/raw/subfinder.txt`. Por segurança,
 somente linhas que sejam hostnames válidos podem ser persistidas nesse arquivo; URLs, IPs e outras
 linhas inesperadas são descartados. Cada hostname é normalizado e deduplicado e volta a passar
 pelo escopo default-deny. Resultados fora do escopo nunca entram em `candidates`.
@@ -124,7 +170,7 @@ bb assets export 1
 ```
 
 Somente candidatos aprovados e ainda em escopo são gravados, em ordem determinística, em
-`runs/<run-id>/assets.jsonl`:
+`.bb/programs/<slug>/runs/<run-id>/assets.jsonl`:
 
 ```jsonl
 {"domain":"api.example.com"}
@@ -189,11 +235,12 @@ O tamanho padrão é 10. É possível escolher entre 1 e 20 itens por lote:
 bb triage 1 --dry-run --batch-size 20
 ```
 
-Os arquivos são gravados em `runs/<run-id>/llm/triage-input-<batch-id>.json`. Por exemplo:
+Os arquivos são gravados em
+`.bb/programs/<slug>/runs/<run-id>/llm/triage-input-<batch-id>.json`. Por exemplo:
 
 ```text
-runs/1/llm/triage-input-0001.json
-runs/1/llm/triage-input-0002.json
+.bb/programs/acme/runs/1/llm/triage-input-0001.json
+.bb/programs/acme/runs/1/llm/triage-input-0002.json
 ```
 
 `run-id` e `batch-id` são identificadores diferentes:
@@ -203,7 +250,7 @@ runs/1/llm/triage-input-0002.json
 - Com o tamanho padrão, uma run com 1 a 10 itens gera apenas `triage-input-0001.json`; com 11 a
   20 itens, gera `0001` e `0002`.
 - Assim, as runs 1 e 2 podem ter, cada uma, seu próprio arquivo `triage-input-0001.json`, em
-  diretórios diferentes: `runs/1/llm/` e `runs/2/llm/`.
+  diretórios diferentes dentro de `.bb/programs/<slug>/runs/`.
 
 Executar novamente a triagem da mesma run recria os mesmos lotes deterministicamente e substitui
 os arquivos `triage-input-*.json` daquele diretório. Nesta etapa, triage não consome a fila e não
@@ -247,30 +294,17 @@ O schema estrito reservado para uma futura resposta é:
 Nesta etapa, `triage` exige explicitamente `--dry-run`. Ele apenas lê o SQLite e grava arquivos
 locais; não importa clientes HTTP, LiteLLM ou Ollama e não envia requisições.
 
-## Banco local
+## Bancos locais isolados
 
-O banco é criado automaticamente em `.bb/orchestrator.db`. Para escolher outro caminho:
+Cada programa usa exclusivamente `.bb/programs/<slug>/orchestrator.db`. Fechar o terminal não
+apaga regras, runs, candidatos, assets ou itens da fila, e trocar a seleção não mistura dados entre
+programas. O arquivo `.bb/current-program.json` contém somente o slug atualmente selecionado.
 
-```bash
-export BB_DB_PATH=/caminho/local/orchestrator.db
-bb queue list
-```
-
-O SQLite é persistente: fechar o terminal não apaga regras, runs, candidatos, assets ou itens da
-fila. Ao abrir outro terminal no mesmo diretório, a CLI volta a usar `.bb/orchestrator.db`. Uma
-nova descoberta ou ingestão cria uma nova run; ela não reinicia a numeração anterior.
-
-Para fazer uma demonstração isolada sem reutilizar o banco padrão, escolha outro arquivo antes de
-executar os comandos:
-
-```bash
-export BB_DB_PATH=.bb/demo.db
-```
-
-As tabelas são `scope_rules`, `runs`, `candidates`, `assets` e `queue_items`. O banco armazena
-regras, hosts normalizados, fonte, estados, timestamps de criação/aprovação/exclusão, contadores,
-referências e hashes SHA-256. O conteúdo bruto e o caminho do JSONL manual não são persistidos.
-A saída segura do subfinder existe somente no arquivo `runs/<run-id>/raw/subfinder.txt`.
+As tabelas incluem `programs`, `scope_rules`, `runs`, `candidates`, `assets` e `queue_items`. Cada
+banco armazena apenas os metadados e dados daquele programa: regras, hosts normalizados, fonte,
+estados, timestamps, contadores, referências e hashes SHA-256. O conteúdo bruto e o caminho do
+JSONL manual não são persistidos. A saída segura do subfinder existe somente no diretório `runs/`
+do programa ativo.
 
 Não coloque API keys em código, arquivos JSON/JSONL ou SQLite. O orquestrador não lê, grava ou
 gerencia credenciais de provedores do subfinder.

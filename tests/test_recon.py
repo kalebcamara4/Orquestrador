@@ -15,6 +15,7 @@ from bb_orchestrator.database import (
     initialize_database,
 )
 from bb_orchestrator.models import AssetModel, CandidateModel
+from bb_orchestrator.programs import create_program, select_program
 from bb_orchestrator.schemas import CandidateStatus
 from bb_orchestrator.services import (
     InputError,
@@ -53,6 +54,11 @@ def _ingest(tmp_path: Path, session, domains: list[str]):
     return ingest_jsonl(input_path, session)
 
 
+def _activate_program(slug: str = "test-program") -> None:
+    create_program(slug, "Test Program")
+    select_program(slug)
+
+
 def test_only_wildcards_produce_enumerable_roots(tmp_path: Path, session) -> None:
     _import_scope(
         tmp_path,
@@ -77,6 +83,7 @@ def test_exact_rule_does_not_run_subfinder(tmp_path: Path, session, monkeypatch)
 
 def test_dry_run_lists_roots_without_subprocess(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
+    _activate_program()
     Path("scope.txt").write_text("api.example.com\n*.example.com\n", encoding="utf-8")
     env = {"BB_DB_PATH": str(tmp_path / "cli.db")}
     runner = CliRunner()
@@ -91,11 +98,12 @@ def test_dry_run_lists_roots_without_subprocess(tmp_path: Path, monkeypatch) -> 
     assert result.exit_code == 0, result.output
     assert "example.com" in result.output
     assert "api.example.com" not in result.output
-    assert not (tmp_path / "runs").exists()
+    assert not (tmp_path / ".bb/programs/test-program/runs/1").exists()
 
 
 def test_recon_confirmation_can_cancel_before_subprocess(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
+    _activate_program()
     Path("scope.txt").write_text("*.example.com\n", encoding="utf-8")
     env = {"BB_DB_PATH": str(tmp_path / "cli.db")}
     runner = CliRunner()
@@ -114,7 +122,7 @@ def test_recon_confirmation_can_cancel_before_subprocess(tmp_path: Path, monkeyp
 
     assert result.exit_code == 0, result.output
     assert "cancelado" in result.output
-    assert not (tmp_path / "runs").exists()
+    assert not (tmp_path / ".bb/programs/test-program/runs/1").exists()
 
 
 def test_confirm_uses_only_subfinder_and_filters_untrusted_output(
@@ -306,6 +314,7 @@ def test_manual_ingest_creates_only_pending_candidates(tmp_path: Path, session) 
 
 def test_fake_data_end_to_end_without_real_network(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
+    _activate_program()
     monkeypatch.setattr(services.shutil, "which", lambda name: "/mock/bin/subfinder")
 
     def fake_run(command, **kwargs):
@@ -366,11 +375,12 @@ def test_fake_data_end_to_end_without_real_network(tmp_path: Path, monkeypatch) 
     assert "aprovados=2" in approved.output
     assert "rejeitados=1" in rejected.output
     assert "excluídos=2" in deleted.output
-    assert (tmp_path / "runs/1/assets.jsonl").read_text(encoding="utf-8") == (
+    program_runs = tmp_path / ".bb/programs/test-program/runs"
+    assert (program_runs / "1/assets.jsonl").read_text(encoding="utf-8") == (
         '{"domain":"api.example.com"}\n{"domain":"dev.example.com"}\n'
     )
     triage_payload = json.loads(
-        (tmp_path / "runs/1/llm/triage-input-0001.json").read_text(encoding="utf-8")
+        (program_runs / "1/llm/triage-input-0001.json").read_text(encoding="utf-8")
     )
     assert {item["host"] for item in triage_payload["items"]} == {
         "api.example.com",

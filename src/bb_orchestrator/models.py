@@ -22,6 +22,16 @@ class ScopeRuleModel(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
 
 
+class ProgramModel(Base):
+    __tablename__ = "programs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    slug: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    archived_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+
 class RunModel(Base):
     __tablename__ = "runs"
 

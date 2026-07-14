@@ -29,12 +29,13 @@ def session(tmp_path: Path):
         yield db_session
 
 
-def test_database_contains_the_five_corresponding_tables(tmp_path: Path) -> None:
+def test_database_contains_the_six_corresponding_tables(tmp_path: Path) -> None:
     engine = create_sqlite_engine(tmp_path / "tables.db")
     initialize_database(engine)
     assert set(inspect(engine).get_table_names()) == {
         "assets",
         "candidates",
+        "programs",
         "queue_items",
         "runs",
         "scope_rules",

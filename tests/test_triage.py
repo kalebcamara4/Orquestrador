@@ -16,6 +16,7 @@ from bb_orchestrator.database import (
     initialize_database,
 )
 from bb_orchestrator.models import AssetModel, QueueItemModel, RunModel
+from bb_orchestrator.programs import create_program, select_program
 from bb_orchestrator.schemas import (
     AssetStatus,
     QueueStatus,
@@ -344,6 +345,8 @@ def test_cli_dry_run_end_to_end(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(socket, "socket", refuse_network)
     monkeypatch.setattr(socket, "create_connection", refuse_network)
     monkeypatch.chdir(tmp_path)
+    create_program("test-program", "Test Program")
+    select_program("test-program")
     Path("scope.txt").write_text("example.com\n*.example.com\n", encoding="utf-8")
     Path("assets.jsonl").write_text(
         '{"domain":"example.com"}\n{"domain":"api.example.com"}\n',
@@ -364,7 +367,7 @@ def test_cli_dry_run_end_to_end(tmp_path: Path, monkeypatch) -> None:
 
     assert result.exit_code == 0, result.output
     assert "itens=2, lotes=1" in result.output
-    output_path = tmp_path / "runs/1/llm/triage-input-0001.json"
+    output_path = tmp_path / ".bb/programs/test-program/runs/1/llm/triage-input-0001.json"
     payload = json.loads(output_path.read_text())
     assert len(payload["items"]) == 2
     assert set(payload["items"][0]) == {

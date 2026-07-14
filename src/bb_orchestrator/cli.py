@@ -5,12 +5,22 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Annotated
 
+import questionary
 import typer
 
 from bb_orchestrator.database import (
     create_session_factory,
     create_sqlite_engine,
     initialize_database,
+)
+from bb_orchestrator.programs import (
+    ProgramError,
+    archive_program,
+    create_program,
+    current_program_slug,
+    list_programs,
+    require_active_program,
+    select_program,
 )
 from bb_orchestrator.services import (
     DEFAULT_TRIAGE_BATCH_SIZE,
@@ -38,12 +48,14 @@ queue_app = typer.Typer(help="Consulta a fila local sanitizada.")
 recon_app = typer.Typer(help="Executa descoberta estritamente passiva.")
 candidates_app = typer.Typer(help="Gerencia a aprovação humana de candidatos.")
 assets_app = typer.Typer(help="Exporta assets aprovados.")
+program_app = typer.Typer(help="Gerencia programas isolados.")
 app.add_typer(scope_app, name="scope")
 app.add_typer(run_app, name="run")
 app.add_typer(queue_app, name="queue")
 app.add_typer(recon_app, name="recon")
 app.add_typer(candidates_app, name="candidates")
 app.add_typer(assets_app, name="assets")
+app.add_typer(program_app, name="program")
 
 InputFile = Annotated[
     Path,
@@ -51,15 +63,121 @@ InputFile = Annotated[
 ]
 
 
-def _session():
-    engine = create_sqlite_engine()
+def _program_session(*, announce: bool = True):
+    try:
+        program = require_active_program()
+    except ProgramError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    if announce:
+        typer.echo(f"Program: {program.slug}")
+    engine = create_sqlite_engine(program.database_path)
     initialize_database(engine)
-    return create_session_factory(engine)()
+    return create_session_factory(engine)(), program
+
+
+def _session(*, announce: bool = True):
+    session, _ = _program_session(announce=announce)
+    return session
 
 
 def _abort(message: str) -> None:
     typer.echo(f"Erro: {message}", err=True)
     raise typer.Exit(code=1)
+
+
+@program_app.command("create")
+def program_create(
+    slug: Annotated[str, typer.Argument()],
+    name: Annotated[str, typer.Option("--name", help="Nome legível do programa.")],
+) -> None:
+    """Cria um programa com banco e diretório de runs isolados."""
+    try:
+        program = create_program(slug, name)
+    except ProgramError as exc:
+        _abort(str(exc))
+    typer.echo(f"Programa criado: {program.slug} — {program.name}")
+    typer.echo(f"Banco: {program.database_path}")
+    if typer.confirm("Deseja selecionar este programa agora?", default=True):
+        try:
+            select_program(program.slug)
+        except ProgramError as exc:
+            _abort(str(exc))
+        typer.echo(f"Programa selecionado: {program.slug}")
+
+
+@program_app.command("list")
+def program_list() -> None:
+    """Lista programas ativos e arquivados sem abrir dados de outras runs."""
+    programs = list_programs()
+    if not programs:
+        typer.echo("Nenhum programa cadastrado.")
+        return
+    try:
+        active_slug = current_program_slug()
+    except ProgramError:
+        active_slug = None
+    typer.echo("ATIVO  SLUG  NOME  ESTADO")
+    for program in programs:
+        marker = "*" if program.slug == active_slug and not program.archived else " "
+        status = "archived" if program.archived else "active"
+        typer.echo(f"{marker}  {program.slug}  {program.name}  {status}")
+
+
+@program_app.command("show")
+def program_show() -> None:
+    """Mostra o programa ativo e os caminhos isolados usados por ele."""
+    try:
+        program = require_active_program()
+    except ProgramError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Program: {program.slug}")
+    typer.echo(f"Name: {program.name}")
+    typer.echo(f"Database: {program.database_path}")
+    typer.echo(f"Runs: {program.runs_path}")
+
+
+@program_app.command("select")
+def program_select(
+    slug: Annotated[str | None, typer.Argument(help="Slug para seleção não interativa.")] = None,
+) -> None:
+    """Seleciona por slug ou abre um menu interativo para programas não arquivados."""
+    selected_slug = slug
+    if selected_slug is None:
+        programs = list_programs(include_archived=False)
+        if not programs:
+            _abort("nenhum programa não arquivado disponível")
+        selected_slug = questionary.select(
+            "Selecione o programa:",
+            choices=[
+                questionary.Choice(
+                    title=f"{program.slug} — {program.name}",
+                    value=program.slug,
+                )
+                for program in programs
+            ],
+            use_shortcuts=True,
+        ).ask()
+        if selected_slug is None:
+            typer.echo("Seleção cancelada; o programa ativo não foi alterado.")
+            return
+
+    try:
+        program = select_program(selected_slug)
+    except ProgramError as exc:
+        _abort(str(exc))
+    typer.echo(f"Programa selecionado: {program.slug}")
+
+
+@program_app.command("archive")
+def program_archive(slug: Annotated[str, typer.Argument()]) -> None:
+    """Arquiva um programa sem apagar seu banco ou seus artefatos."""
+    try:
+        program = archive_program(slug)
+    except ProgramError as exc:
+        _abort(str(exc))
+    typer.echo(f"Programa arquivado: {program.slug}")
 
 
 @scope_app.command("import")
@@ -102,7 +220,8 @@ def recon_passive(
     if dry_run == confirm:
         _abort("informe exatamente uma opção: --dry-run ou --confirm")
 
-    with _session() as session:
+    session, program = _program_session()
+    with session:
         if dry_run:
             roots = passive_recon_roots(session)
             if not roots:
@@ -123,7 +242,7 @@ def recon_passive(
             typer.echo("Recon passivo cancelado; nenhum subprocesso foi executado.")
             return
         try:
-            result = run_passive_recon(session)
+            result = run_passive_recon(session, runs_path=program.runs_path)
         except InputError as exc:
             _abort(str(exc))
     typer.echo(
@@ -181,7 +300,7 @@ def candidates_approve(
     hosts = _select_pending_candidates(run_id, "aprovar")
     if not hosts:
         return
-    with _session() as session:
+    with _session(announce=False) as session:
         try:
             result = approve_candidates(run_id, session, hosts=hosts)
         except InputError as exc:
@@ -197,7 +316,7 @@ def candidates_reject(
     hosts = _select_pending_candidates(run_id, "rejeitar")
     if not hosts:
         return
-    with _session() as session:
+    with _session(announce=False) as session:
         try:
             result = reject_candidates(run_id, session, hosts=hosts)
         except InputError as exc:
@@ -217,7 +336,7 @@ def candidates_delete(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
     ):
         typer.echo("Exclusão cancelada; nenhuma alteração foi aplicada.")
         return
-    with _session() as session:
+    with _session(announce=False) as session:
         try:
             result = delete_candidates(run_id, session, hosts=hosts)
         except InputError as exc:
@@ -228,9 +347,10 @@ def candidates_delete(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
 @assets_app.command("export")
 def assets_export(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
     """Exporta somente candidatos aprovados para o assets.jsonl da run."""
-    with _session() as session:
+    session, program = _program_session()
+    with session:
         try:
-            result = export_assets(run_id, session)
+            result = export_assets(run_id, session, runs_path=program.runs_path)
         except InputError as exc:
             _abort(str(exc))
     typer.echo(f"Run {run_id}: assets exportados={result.exported}; arquivo={result.path}.")
@@ -268,14 +388,20 @@ def triage(
     if not dry_run:
         _abort("triage está disponível somente com --dry-run nesta etapa")
 
-    with _session() as session:
+    session, program = _program_session()
+    with session:
         try:
-            result = prepare_triage(run_id, session, batch_size=batch_size)
+            result = prepare_triage(
+                run_id,
+                session,
+                batch_size=batch_size,
+                runs_path=program.runs_path,
+            )
         except InputError as exc:
             _abort(str(exc))
     typer.echo(
         f"Run {run_id}: itens={result.item_count}, lotes={result.batch_count}; "
-        f"arquivos em runs/{run_id}/llm/."
+        f"arquivos em {program.runs_path}/{run_id}/llm/."
     )
 
 
