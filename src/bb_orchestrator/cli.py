@@ -13,10 +13,13 @@ from bb_orchestrator.database import (
     initialize_database,
 )
 from bb_orchestrator.services import (
+    DEFAULT_TRIAGE_BATCH_SIZE,
+    MAX_TRIAGE_BATCH_SIZE,
     InputError,
     import_scope_file,
     ingest_jsonl,
     list_queue,
+    prepare_triage,
     sanitize_run,
 )
 
@@ -79,6 +82,38 @@ def sanitize(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
         except InputError as exc:
             _abort(str(exc))
     typer.echo(f"Run {run_id}: sanitizados={result.sanitized}, enfileirados={result.queued}.")
+
+
+@app.command("triage")
+def triage(
+    run_id: Annotated[int, typer.Argument(min=1)],
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Somente prepara arquivos locais; não usa rede."),
+    ] = False,
+    batch_size: Annotated[
+        int,
+        typer.Option(
+            "--batch-size",
+            min=1,
+            max=MAX_TRIAGE_BATCH_SIZE,
+            help="Quantidade de itens por lote.",
+        ),
+    ] = DEFAULT_TRIAGE_BATCH_SIZE,
+) -> None:
+    """Prepara lotes determinísticos para triagem futura por LLM."""
+    if not dry_run:
+        _abort("triage está disponível somente com --dry-run nesta etapa")
+
+    with _session() as session:
+        try:
+            result = prepare_triage(run_id, session, batch_size=batch_size)
+        except InputError as exc:
+            _abort(str(exc))
+    typer.echo(
+        f"Run {run_id}: itens={result.item_count}, lotes={result.batch_count}; "
+        f"arquivos em runs/{run_id}/llm/."
+    )
 
 
 @queue_app.command("list")

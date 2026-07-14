@@ -4,8 +4,17 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 from bb_orchestrator.domain import ScopeKind, normalize_domain, parse_scope_pattern
 
@@ -89,3 +98,58 @@ class IngestRecord(Schema):
     @classmethod
     def validate_domain(cls, value: str) -> str:
         return normalize_domain(value)
+
+
+class TriageSchema(BaseModel):
+    """Base estrita para tudo que pode cruzar a futura fronteira de LLM."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class TriageAsset(TriageSchema):
+    """Allowlist mínima de um ativo preparado para triagem."""
+
+    asset_id: StrictStr = Field(min_length=1, max_length=80)
+    host: StrictStr = Field(min_length=1, max_length=253)
+    status: StrictInt | None = Field(ge=100, le=599)
+    title: StrictStr | None = Field(max_length=500)
+    technologies: list[StrictStr] = Field(max_length=50)
+    paths: list[StrictStr] = Field(max_length=100)
+
+    @field_validator("host")
+    @classmethod
+    def validate_host(cls, value: str) -> str:
+        return normalize_domain(value)
+
+
+class _TriageItems(TriageSchema):
+    batch_id: StrictStr = Field(min_length=1, max_length=80)
+    items: list[TriageAsset] = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def refuse_duplicate_asset_ids(self) -> _TriageItems:
+        asset_ids = [item.asset_id for item in self.items]
+        if len(asset_ids) != len(set(asset_ids)):
+            raise ValueError("asset_id duplicado no lote de triagem")
+        return self
+
+
+class TriageBatch(_TriageItems):
+    """Lote determinístico, limitado a vinte ativos."""
+
+
+class TriageRequest(_TriageItems):
+    """Payload serializado de uma futura requisição de triagem."""
+
+
+class TriageDecision(TriageSchema):
+    asset_id: StrictStr = Field(min_length=1, max_length=80)
+    decision: Literal["IGNORE", "LOW_PRIORITY", "NEEDS_REVIEW"]
+    confidence: Literal["LOW", "MEDIUM", "HIGH"]
+    evidence: list[StrictStr] = Field(max_length=50)
+    missing_context: list[StrictStr] = Field(max_length=50)
+    manual_review_question: StrictStr | None = Field(max_length=500)
+
+
+class TriageResponse(TriageSchema):
+    items: list[TriageDecision]
