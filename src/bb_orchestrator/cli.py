@@ -27,7 +27,6 @@ from bb_orchestrator.services import (
     MAX_TRIAGE_BATCH_SIZE,
     InputError,
     approve_candidates,
-    delete_candidates,
     export_assets,
     import_scope_file,
     ingest_jsonl,
@@ -39,7 +38,6 @@ from bb_orchestrator.services import (
     run_passive_recon,
     sanitize_run,
 )
-from bb_orchestrator.terminal_ui import ChecklistItem, SelectionCancelled, select_checkboxes
 
 app = typer.Typer(name="bb", help="Orquestrador local para bug bounty autorizado.")
 scope_app = typer.Typer(help="Gerencia regras determinísticas de escopo.")
@@ -213,10 +211,10 @@ def recon_passive(
     ] = False,
     confirm: Annotated[
         bool,
-        typer.Option("--confirm", help="Abre a confirmação antes de executar o subfinder."),
+        typer.Option("--confirm", help="Autoriza a criação da run e a execução do subfinder."),
     ] = False,
 ) -> None:
-    """Enumera passivamente apenas raízes autorizadas por wildcard."""
+    """Cria candidatos exatos e enumera apenas raízes autorizadas por wildcard."""
     if dry_run == confirm:
         _abort("informe exatamente uma opção: --dry-run ou --confirm")
 
@@ -232,24 +230,14 @@ def recon_passive(
                 typer.echo(root)
             return
 
-        roots = passive_recon_roots(session)
-        if not roots:
-            _abort("nenhuma regra wildcard autoriza enumeração passiva")
-        typer.echo("O subfinder será executado passivamente para:")
-        for root in roots:
-            typer.echo(f"- {root}")
-        if not typer.confirm("Confirma a execução do recon passivo?", default=False):
-            typer.echo("Recon passivo cancelado; nenhum subprocesso foi executado.")
-            return
         try:
             result = run_passive_recon(session, runs_path=program.runs_path)
         except InputError as exc:
             _abort(str(exc))
-    typer.echo(
-        f"Run {result.run_id}: candidatos={result.accepted}, "
-        f"descartados={result.rejected}, duplicados={result.duplicates}; "
-        f"raw={result.raw_path}."
-    )
+    summary = f"Run {result.run_id}: candidatos={result.accepted}, duplicados={result.duplicates}."
+    if result.raw_path is not None:
+        summary += f" Raw: {result.raw_path}."
+    typer.echo(summary)
 
 
 @candidates_app.command("list")
@@ -268,41 +256,27 @@ def candidates_list(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
         typer.echo(f"{candidate.id}  {candidate.host}  {candidate.source}  {candidate.status}")
 
 
-def _select_pending_candidates(run_id: int, action: str) -> list[str]:
-    with _session() as session:
-        try:
-            candidates = list_candidates(run_id, session)
-        except InputError as exc:
-            _abort(str(exc))
-    if not candidates:
-        typer.echo("Nenhum candidato pendente em escopo.")
-        return []
-
-    items = [
-        ChecklistItem(
-            value=candidate.host,
-            label=f"{candidate.host}  ({candidate.source}, {candidate.status})",
-        )
-        for candidate in candidates
-    ]
-    try:
-        return select_checkboxes(f"Selecione os candidatos para {action}:", items)
-    except SelectionCancelled:
-        typer.echo("Seleção cancelada; nenhuma alteração foi aplicada.")
-        return []
-
-
 @candidates_app.command("approve")
 def candidates_approve(
     run_id: Annotated[int, typer.Argument(min=1)],
+    approve_all: Annotated[
+        bool,
+        typer.Option("--all", help="Aprova todos os candidatos pendentes em escopo."),
+    ] = False,
+    hosts: Annotated[
+        list[str] | None,
+        typer.Option("--host", help="Host a aprovar; a opção pode ser repetida."),
+    ] = None,
 ) -> None:
-    """Seleciona e aprova candidatos pendentes em um checklist."""
-    hosts = _select_pending_candidates(run_id, "aprovar")
-    if not hosts:
-        return
-    with _session(announce=False) as session:
+    """Aprova todos os pendentes ou uma lista explícita de hosts."""
+    with _session() as session:
         try:
-            result = approve_candidates(run_id, session, hosts=hosts)
+            result = approve_candidates(
+                run_id,
+                session,
+                hosts=hosts,
+                approve_all=approve_all,
+            )
         except InputError as exc:
             _abort(str(exc))
     typer.echo(f"Run {run_id}: aprovados={result.changed}, inalterados={result.unchanged}.")
@@ -311,37 +285,18 @@ def candidates_approve(
 @candidates_app.command("reject")
 def candidates_reject(
     run_id: Annotated[int, typer.Argument(min=1)],
+    hosts: Annotated[
+        list[str] | None,
+        typer.Option("--host", help="Host a rejeitar; a opção pode ser repetida."),
+    ] = None,
 ) -> None:
-    """Seleciona e rejeita candidatos pendentes em um checklist."""
-    hosts = _select_pending_candidates(run_id, "rejeitar")
-    if not hosts:
-        return
-    with _session(announce=False) as session:
+    """Rejeita uma lista explícita de candidatos."""
+    with _session() as session:
         try:
-            result = reject_candidates(run_id, session, hosts=hosts)
+            result = reject_candidates(run_id, session, hosts=hosts or ())
         except InputError as exc:
             _abort(str(exc))
     typer.echo(f"Run {run_id}: rejeitados={result.changed}, inalterados={result.unchanged}.")
-
-
-@candidates_app.command("delete")
-def candidates_delete(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
-    """Seleciona e exclui logicamente candidatos pendentes."""
-    hosts = _select_pending_candidates(run_id, "excluir")
-    if not hosts:
-        return
-    if not typer.confirm(
-        f"Excluir {len(hosts)} candidato(s) da seleção, preservando o histórico?",
-        default=False,
-    ):
-        typer.echo("Exclusão cancelada; nenhuma alteração foi aplicada.")
-        return
-    with _session(announce=False) as session:
-        try:
-            result = delete_candidates(run_id, session, hosts=hosts)
-        except InputError as exc:
-            _abort(str(exc))
-    typer.echo(f"Run {run_id}: excluídos={result.changed}, inalterados={result.unchanged}.")
 
 
 @assets_app.command("export")

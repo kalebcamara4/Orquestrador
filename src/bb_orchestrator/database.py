@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sqlalchemy import Engine, create_engine, inspect
+from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from bb_orchestrator.models import Base
@@ -17,10 +17,6 @@ def create_sqlite_engine(path: Path) -> Engine:
 
 def initialize_database(engine: Engine) -> None:
     Base.metadata.create_all(engine)
-    candidate_columns = {column["name"] for column in inspect(engine).get_columns("candidates")}
-    if "deleted_at" not in candidate_columns:
-        with engine.begin() as connection:
-            connection.exec_driver_sql("ALTER TABLE candidates ADD COLUMN deleted_at DATETIME")
 
 
 def create_session_factory(engine: Engine) -> sessionmaker[Session]:

@@ -70,10 +70,9 @@ class CandidateModel(Base):
     run_id: Mapped[int] = mapped_column(ForeignKey("runs.id"), nullable=False, index=True)
     host: Mapped[str] = mapped_column(String(253), nullable=False)
     source: Mapped[str] = mapped_column(String(32), nullable=False)
-    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
     approved_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    deleted_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
 
 class QueueItemModel(Base):

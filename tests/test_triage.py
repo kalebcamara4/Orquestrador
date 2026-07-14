@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import select
 from typer.testing import CliRunner
 
-import bb_orchestrator.cli as cli
 import bb_orchestrator.services as services
 from bb_orchestrator.cli import app
 from bb_orchestrator.database import (
@@ -15,7 +15,13 @@ from bb_orchestrator.database import (
     create_sqlite_engine,
     initialize_database,
 )
-from bb_orchestrator.models import AssetModel, QueueItemModel, RunModel
+from bb_orchestrator.models import (
+    AssetModel,
+    CandidateModel,
+    QueueItemModel,
+    RunModel,
+    ScopeRuleModel,
+)
 from bb_orchestrator.programs import create_program, select_program
 from bb_orchestrator.schemas import (
     AssetStatus,
@@ -43,6 +49,14 @@ def session(tmp_path: Path):
 
 
 def _add_run(session, domains: list[str]) -> RunModel:
+    if session.scalar(select(ScopeRuleModel.id).limit(1)) is None:
+        session.add_all(
+            [
+                ScopeRuleModel(pattern="example.com", kind="exact"),
+                ScopeRuleModel(pattern="*.example.com", kind="wildcard"),
+            ]
+        )
+        session.flush()
     run = RunModel(
         source_sha256="0" * 64,
         status=RunStatus.SANITIZED.value,
@@ -53,6 +67,15 @@ def _add_run(session, domains: list[str]) -> RunModel:
     session.add(run)
     session.flush()
     for domain in domains:
+        session.add(
+            CandidateModel(
+                run_id=run.id,
+                host=domain,
+                source="test",
+                status="approved",
+                approved_at=datetime.now(UTC),
+            )
+        )
         asset = AssetModel(
             run_id=run.id,
             domain=domain,
@@ -356,12 +379,7 @@ def test_cli_dry_run_end_to_end(tmp_path: Path, monkeypatch) -> None:
 
     assert runner.invoke(app, ["scope", "import", "scope.txt"], env=env).exit_code == 0
     assert runner.invoke(app, ["run", "ingest", "assets.jsonl"], env=env).exit_code == 0
-    monkeypatch.setattr(
-        cli,
-        "select_checkboxes",
-        lambda title, items: [item.value for item in items],
-    )
-    assert runner.invoke(app, ["candidates", "approve", "1"], env=env).exit_code == 0
+    assert runner.invoke(app, ["candidates", "approve", "1", "--all"], env=env).exit_code == 0
     assert runner.invoke(app, ["sanitize", "1"], env=env).exit_code == 0
     result = runner.invoke(app, ["triage", "1", "--dry-run"], env=env)
 

@@ -42,26 +42,19 @@ def test_database_contains_the_six_corresponding_tables(tmp_path: Path) -> None:
     }
 
 
-def test_database_adds_deleted_at_to_existing_candidates_table(tmp_path: Path) -> None:
-    engine = create_sqlite_engine(tmp_path / "migration.db")
-    with engine.begin() as connection:
-        connection.exec_driver_sql(
-            """
-            CREATE TABLE candidates (
-                id INTEGER PRIMARY KEY,
-                run_id INTEGER NOT NULL,
-                host VARCHAR(253) NOT NULL,
-                source VARCHAR(32) NOT NULL,
-                status VARCHAR(16) NOT NULL,
-                created_at DATETIME NOT NULL,
-                approved_at DATETIME
-            )
-            """
-        )
-
+def test_candidates_table_has_the_required_auditable_columns(tmp_path: Path) -> None:
+    engine = create_sqlite_engine(tmp_path / "columns.db")
     initialize_database(engine)
 
-    assert "deleted_at" in {column["name"] for column in inspect(engine).get_columns("candidates")}
+    assert {column["name"] for column in inspect(engine).get_columns("candidates")} == {
+        "id",
+        "run_id",
+        "host",
+        "source",
+        "status",
+        "created_at",
+        "approved_at",
+    }
 
 
 def test_ingest_filters_scope_deduplicates_and_sanitize_queues(tmp_path: Path, session) -> None:
@@ -105,3 +98,24 @@ def test_ingest_schema_refuses_raw_or_sensitive_extra_fields() -> None:
         IngestRecord.model_validate(
             {"domain": "example.com", "headers": {"Authorization": "secret"}}
         )
+
+
+def test_sanitize_ignores_assets_without_an_approved_candidate(tmp_path: Path, session) -> None:
+    scope_file = tmp_path / "scope.txt"
+    scope_file.write_text("*.example.com\n", encoding="utf-8")
+    import_scope_file(scope_file, session)
+    input_file = tmp_path / "assets.jsonl"
+    input_file.write_text('{"domain":"api.example.com"}\n', encoding="utf-8")
+    run = ingest_jsonl(input_file, session)
+    legacy_asset = AssetModel(run_id=run.id, domain="api.example.com", status="ingested")
+    session.add(legacy_asset)
+    session.commit()
+
+    refused = sanitize_run(run.id, session)
+    assert (refused.sanitized, refused.queued) == (0, 0)
+    assert legacy_asset.status == "ingested"
+    assert list_queue(session) == []
+
+    approve_candidates(run.id, session, hosts=["api.example.com"])
+    accepted = sanitize_run(run.id, session)
+    assert (accepted.sanitized, accepted.queued) == (1, 1)

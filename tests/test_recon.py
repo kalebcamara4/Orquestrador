@@ -6,7 +6,6 @@ import pytest
 from sqlalchemy import select
 from typer.testing import CliRunner
 
-import bb_orchestrator.cli as cli
 import bb_orchestrator.services as services
 from bb_orchestrator.cli import app
 from bb_orchestrator.database import (
@@ -20,7 +19,6 @@ from bb_orchestrator.schemas import CandidateStatus
 from bb_orchestrator.services import (
     InputError,
     approve_candidates,
-    delete_candidates,
     export_assets,
     import_scope_file,
     ingest_jsonl,
@@ -76,9 +74,22 @@ def test_exact_rule_does_not_run_subfinder(tmp_path: Path, session, monkeypatch)
         pytest.fail("uma regra exata tentou enumerar subdomínios")
 
     monkeypatch.setattr(services.subprocess, "run", refuse_subprocess)
+    monkeypatch.setattr(
+        services.shutil,
+        "which",
+        lambda name: pytest.fail("uma regra exata procurou o subfinder"),
+    )
 
-    with pytest.raises(InputError, match="nenhuma regra wildcard"):
-        run_passive_recon(session, runs_path=tmp_path / "runs")
+    result = run_passive_recon(session, runs_path=tmp_path / "runs")
+
+    candidate = session.scalar(select(CandidateModel))
+    assert result.accepted == 1
+    assert result.raw_path is None
+    assert (candidate.host, candidate.source, candidate.status) == (
+        "api.example.com",
+        "scope_exact",
+        "pending",
+    )
 
 
 def test_dry_run_lists_roots_without_subprocess(tmp_path: Path, monkeypatch) -> None:
@@ -101,7 +112,7 @@ def test_dry_run_lists_roots_without_subprocess(tmp_path: Path, monkeypatch) -> 
     assert not (tmp_path / ".bb/programs/test-program/runs/1").exists()
 
 
-def test_recon_confirmation_can_cancel_before_subprocess(tmp_path: Path, monkeypatch) -> None:
+def test_confirm_flag_is_the_explicit_authorization(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     _activate_program()
     Path("scope.txt").write_text("*.example.com\n", encoding="utf-8")
@@ -109,20 +120,19 @@ def test_recon_confirmation_can_cancel_before_subprocess(tmp_path: Path, monkeyp
     runner = CliRunner()
     assert runner.invoke(app, ["scope", "import", "scope.txt"], env=env).exit_code == 0
 
-    def refuse_subprocess(*args, **kwargs):
-        pytest.fail("recon cancelado executou um subprocesso")
+    monkeypatch.setattr(services.shutil, "which", lambda name: "/mock/bin/subfinder")
+    calls = []
 
-    monkeypatch.setattr(services.subprocess, "run", refuse_subprocess)
-    result = runner.invoke(
-        app,
-        ["recon", "passive", "--confirm"],
-        env=env,
-        input="n\n",
-    )
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="api.example.com\n", stderr="")
+
+    monkeypatch.setattr(services.subprocess, "run", fake_run)
+    result = runner.invoke(app, ["recon", "passive", "--confirm"], env=env)
 
     assert result.exit_code == 0, result.output
-    assert "cancelado" in result.output
-    assert not (tmp_path / ".bb/programs/test-program/runs/1").exists()
+    assert calls == [["/mock/bin/subfinder", "-silent", "-duc", "-d", "example.com"]]
+    assert (tmp_path / ".bb/programs/test-program/runs/1/raw/subfinder.txt").is_file()
 
 
 def test_confirm_uses_only_subfinder_and_filters_untrusted_output(
@@ -164,10 +174,7 @@ def test_confirm_uses_only_subfinder_and_filters_untrusted_output(
     assert result.rejected == 5
     assert list(session.scalars(select(CandidateModel.host))) == ["api.example.com"]
     raw = result.raw_path.read_text(encoding="utf-8")
-    assert "outside.test" in raw
-    assert "example.com.attacker.test" in raw
-    assert "https://" not in raw
-    assert "192.0.2.10" not in raw
+    assert raw == "api.example.com\n"
 
 
 def test_missing_subfinder_has_clear_error(tmp_path: Path, session, monkeypatch) -> None:
@@ -198,15 +205,28 @@ def test_candidates_list_is_pending_and_default_deny(tmp_path: Path, session) ->
     ]
 
 
-def test_candidate_actions_no_longer_accept_manually_typed_hosts(tmp_path: Path) -> None:
-    result = CliRunner().invoke(
+def test_candidate_cli_accepts_repeated_hosts_and_all(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    _activate_program()
+    Path("scope.txt").write_text("*.example.com\n", encoding="utf-8")
+    Path("assets.jsonl").write_text(
+        '{"domain":"api.example.com"}\n{"domain":"dev.example.com"}\n',
+        encoding="utf-8",
+    )
+    runner = CliRunner()
+    assert runner.invoke(app, ["scope", "import", "scope.txt"]).exit_code == 0
+    assert runner.invoke(app, ["run", "ingest", "assets.jsonl"]).exit_code == 0
+
+    approved = runner.invoke(
         app,
         ["candidates", "approve", "1", "--host", "api.example.com"],
-        env={"BB_DB_PATH": str(tmp_path / "cli.db")},
     )
+    approve_all = runner.invoke(app, ["candidates", "approve", "1", "--all"])
 
-    assert result.exit_code == 2
-    assert "No such option" in result.output
+    assert approved.exit_code == approve_all.exit_code == 0
+    assert "Program: test-program" in approved.output
+    assert "aprovados=1" in approved.output
+    assert "aprovados=1" in approve_all.output
 
 
 def test_approve_all_approve_host_and_reject_host_are_idempotent(tmp_path: Path, session) -> None:
@@ -244,32 +264,6 @@ def test_terminal_candidate_cannot_be_changed_to_opposite_state(tmp_path: Path, 
 
     with pytest.raises(InputError, match="estado terminal preservado"):
         reject_candidates(run.id, session, hosts=["api.example.com"])
-
-
-def test_delete_candidates_is_bulk_idempotent_and_auditable(tmp_path: Path, session) -> None:
-    _import_scope(tmp_path, session, "*.example.com\n")
-    run = _ingest(
-        tmp_path,
-        session,
-        ["api.example.com", "dev.example.com"],
-    )
-
-    first = delete_candidates(
-        run.id,
-        session,
-        hosts=["api.example.com", "dev.example.com"],
-    )
-    repeated = delete_candidates(
-        run.id,
-        session,
-        hosts=["api.example.com", "dev.example.com"],
-    )
-    persisted = list(session.scalars(select(CandidateModel).order_by(CandidateModel.host)))
-
-    assert (first.changed, first.unchanged) == (2, 0)
-    assert (repeated.changed, repeated.unchanged) == (0, 2)
-    assert all(candidate.deleted_at is not None for candidate in persisted)
-    assert list_candidates(run.id, session) == []
 
 
 def test_assets_export_is_deterministic_and_contains_only_approved(tmp_path: Path, session) -> None:
@@ -321,31 +315,13 @@ def test_fake_data_end_to_end_without_real_network(tmp_path: Path, monkeypatch) 
         return subprocess.CompletedProcess(
             command,
             0,
-            stdout=(
-                "api.example.com\n"
-                "dev.example.com\n"
-                "old.example.com\n"
-                "temp-one.example.com\n"
-                "temp-two.example.com\n"
-                "outside.test\n"
-            ),
+            stdout=("api.example.com\ndev.example.com\nold.example.com\noutside.test\n"),
             stderr="",
         )
 
     monkeypatch.setattr(services.subprocess, "run", fake_run)
 
-    def fake_checklist(title, items):
-        available = {item.value for item in items}
-        if "aprovar" in title:
-            return ["api.example.com", "dev.example.com"]
-        if "rejeitar" in title:
-            return ["old.example.com"]
-        if "excluir" in title:
-            return sorted(available & {"temp-one.example.com", "temp-two.example.com"})
-        pytest.fail(f"checklist inesperado: {title}")
-
-    monkeypatch.setattr(cli, "select_checkboxes", fake_checklist)
-    Path("scope.txt").write_text("*.example.com\n", encoding="utf-8")
+    Path("scope.txt").write_text("example.com\n*.example.com\n", encoding="utf-8")
     env = {"BB_DB_PATH": str(tmp_path / "cli.db")}
     runner = CliRunner()
 
@@ -354,27 +330,35 @@ def test_fake_data_end_to_end_without_real_network(tmp_path: Path, monkeypatch) 
         app,
         ["recon", "passive", "--confirm"],
         env=env,
-        input="y\n",
     )
     pending = runner.invoke(app, ["candidates", "list", "1"], env=env)
-    approved = runner.invoke(app, ["candidates", "approve", "1"], env=env)
-    rejected = runner.invoke(app, ["candidates", "reject", "1"], env=env)
-    deleted = runner.invoke(
+    approved = runner.invoke(
         app,
-        ["candidates", "delete", "1"],
+        [
+            "candidates",
+            "approve",
+            "1",
+            "--host",
+            "api.example.com",
+            "--host",
+            "dev.example.com",
+        ],
         env=env,
-        input="y\n",
+    )
+    rejected = runner.invoke(
+        app,
+        ["candidates", "reject", "1", "--host", "old.example.com"],
+        env=env,
     )
     exported = runner.invoke(app, ["assets", "export", "1"], env=env)
     sanitized = runner.invoke(app, ["sanitize", "1"], env=env)
     triaged = runner.invoke(app, ["triage", "1", "--dry-run"], env=env)
 
-    for result in (recon, pending, approved, rejected, deleted, exported, sanitized, triaged):
+    for result in (recon, pending, approved, rejected, exported, sanitized, triaged):
         assert result.exit_code == 0, result.output
     assert "outside.test" not in pending.output
     assert "aprovados=2" in approved.output
     assert "rejeitados=1" in rejected.output
-    assert "excluídos=2" in deleted.output
     program_runs = tmp_path / ".bb/programs/test-program/runs"
     assert (program_runs / "1/assets.jsonl").read_text(encoding="utf-8") == (
         '{"domain":"api.example.com"}\n{"domain":"dev.example.com"}\n'

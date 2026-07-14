@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from bb_orchestrator.domain import (
@@ -101,7 +101,7 @@ class PassiveReconResult:
     accepted: int
     rejected: int
     duplicates: int
-    raw_path: Path
+    raw_path: Path | None
 
 
 @dataclass(frozen=True)
@@ -206,6 +206,22 @@ def passive_recon_roots(session: Session) -> list[str]:
     return sorted(roots)
 
 
+def exact_scope_hosts(session: Session) -> list[str]:
+    """Retorna regras exatas como hosts candidatos, sem autorizar enumeração."""
+    hosts: set[str] = set()
+    patterns = session.scalars(
+        select(ScopeRuleModel.pattern).where(ScopeRuleModel.kind == ScopeKind.EXACT.value)
+    )
+    for pattern in patterns:
+        try:
+            kind, normalized_pattern = parse_scope_pattern(pattern)
+        except (InvalidDomain, ValueError):
+            continue
+        if kind is ScopeKind.EXACT:
+            hosts.add(normalized_pattern)
+    return sorted(hosts)
+
+
 def _is_safely_in_scope(host: str, patterns: Sequence[str]) -> bool:
     try:
         return is_domain_in_scope(host, patterns)
@@ -226,32 +242,36 @@ def _write_atomic(path: Path, content: str, error_context: str) -> None:
         raise InputError(f"não foi possível gravar {error_context}: {exc}") from exc
 
 
-def _safe_subfinder_output(stdout: str) -> tuple[str, list[str], int, int]:
-    """Mantém no raw apenas linhas que sejam hostnames, antes do filtro de escopo."""
-    raw_lines: list[str] = []
+def _filter_subfinder_output(
+    stdout: str,
+    patterns: Sequence[str],
+) -> tuple[str, list[str], int, int]:
+    """Aplica validação, escopo default-deny e deduplicação a cada linha recebida."""
     unique_hosts: list[str] = []
     seen_hosts: set[str] = set()
-    invalid_count = 0
+    rejected_count = 0
     duplicate_count = 0
 
-    for raw_line in stdout.splitlines(keepends=True):
+    for raw_line in stdout.splitlines():
         observed = raw_line.strip()
         if not observed:
             continue
         try:
             host = normalize_domain(observed)
         except (InvalidDomain, ValueError):
-            invalid_count += 1
+            rejected_count += 1
             continue
-        raw_lines.append(raw_line)
+        if not _is_safely_in_scope(host, patterns):
+            rejected_count += 1
+            continue
         if host in seen_hosts:
             duplicate_count += 1
             continue
         seen_hosts.add(host)
         unique_hosts.append(host)
 
-    raw_content = "".join(raw_lines)
-    return raw_content, unique_hosts, invalid_count, duplicate_count
+    raw_content = "".join(f"{host}\n" for host in unique_hosts)
+    return raw_content, unique_hosts, rejected_count, duplicate_count
 
 
 def run_passive_recon(
@@ -261,14 +281,17 @@ def run_passive_recon(
 ) -> PassiveReconResult:
     """Executa exclusivamente subfinder; não resolve nem contata os hosts retornados."""
     roots = passive_recon_roots(session)
-    if not roots:
-        raise InputError("nenhuma regra wildcard autoriza enumeração passiva")
+    exact_hosts = exact_scope_hosts(session)
+    if not roots and not exact_hosts:
+        raise InputError("nenhuma regra de escopo importada para descoberta passiva")
 
-    subfinder_path = shutil.which("subfinder")
-    if subfinder_path is None:
-        raise InputError(
-            "subfinder não está instalado; instale-o manualmente e adicione o binário ao PATH"
-        )
+    subfinder_path: str | None = None
+    if roots:
+        subfinder_path = shutil.which("subfinder")
+        if subfinder_path is None:
+            raise InputError(
+                "subfinder não está instalado; instale-o manualmente e adicione o binário ao PATH"
+            )
 
     run = RunModel(
         source_sha256="0" * 64,
@@ -280,42 +303,63 @@ def run_passive_recon(
     session.add(run)
     session.flush()
 
-    command = [subfinder_path, "-silent", "-duc"]
-    for root in roots:
-        command.extend(("-d", root))
-    try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            check=False,
-            encoding="utf-8",
-            errors="replace",
-            stdin=subprocess.DEVNULL,
-            shell=False,
-            text=True,
-            timeout=SUBFINDER_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        session.rollback()
-        raise InputError("não foi possível executar o subfinder") from exc
-
-    if completed.returncode != 0:
-        session.rollback()
-        raise InputError(f"subfinder terminou com código {completed.returncode}")
-
-    raw_content, observed_hosts, invalid_count, duplicate_count = _safe_subfinder_output(
-        completed.stdout or ""
-    )
-    raw_path = runs_path / str(run.id) / "raw" / "subfinder.txt"
-    try:
-        _write_atomic(raw_path, raw_content, "a saída segura do subfinder")
-    except InputError:
-        session.rollback()
-        raise
-
     patterns = _scope_patterns(session)
-    accepted_hosts = [host for host in observed_hosts if _is_safely_in_scope(host, patterns)]
-    rejected_count = invalid_count + len(observed_hosts) - len(accepted_hosts)
+    raw_content = ""
+    observed_hosts: list[str] = []
+    rejected_count = 0
+    duplicate_count = 0
+    raw_path: Path | None = None
+    if roots:
+        command = [subfinder_path, "-silent", "-duc"]
+        for root in roots:
+            command.extend(("-d", root))
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                check=False,
+                encoding="utf-8",
+                errors="replace",
+                stdin=subprocess.DEVNULL,
+                shell=False,
+                text=True,
+                timeout=SUBFINDER_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            session.rollback()
+            raise InputError("não foi possível executar o subfinder") from exc
+
+        if completed.returncode != 0:
+            session.rollback()
+            raise InputError(f"subfinder terminou com código {completed.returncode}")
+
+        raw_content, observed_hosts, rejected_count, duplicate_count = _filter_subfinder_output(
+            completed.stdout or "", patterns
+        )
+        raw_path = runs_path / str(run.id) / "raw" / "subfinder.txt"
+        try:
+            _write_atomic(raw_path, raw_content, "a saída segura do subfinder")
+        except InputError:
+            session.rollback()
+            raise
+
+    exact_host_set = set(exact_hosts)
+    discovered_hosts: list[str] = []
+    for host in observed_hosts:
+        if host in exact_host_set:
+            duplicate_count += 1
+        else:
+            discovered_hosts.append(host)
+
+    session.add_all(
+        CandidateModel(
+            run_id=run.id,
+            host=host,
+            source="scope_exact",
+            status=CandidateStatus.PENDING.value,
+        )
+        for host in exact_hosts
+    )
     session.add_all(
         CandidateModel(
             run_id=run.id,
@@ -323,16 +367,17 @@ def run_passive_recon(
             source="subfinder",
             status=CandidateStatus.PENDING.value,
         )
-        for host in accepted_hosts
+        for host in discovered_hosts
     )
-    run.source_sha256 = hashlib.sha256(raw_content.encode("utf-8")).hexdigest()
-    run.accepted_count = len(accepted_hosts)
+    source_content = "".join(f"scope_exact:{host}\n" for host in exact_hosts) + raw_content
+    run.source_sha256 = hashlib.sha256(source_content.encode("utf-8")).hexdigest()
+    run.accepted_count = len(exact_hosts) + len(discovered_hosts)
     run.rejected_count = rejected_count
     run.duplicate_count = duplicate_count
     session.commit()
     return PassiveReconResult(
         run_id=run.id,
-        accepted=len(accepted_hosts),
+        accepted=run.accepted_count,
         rejected=rejected_count,
         duplicates=duplicate_count,
         raw_path=raw_path,
@@ -399,7 +444,6 @@ def list_candidates(run_id: int, session: Session) -> list[CandidateModel]:
         .where(
             CandidateModel.run_id == run_id,
             CandidateModel.status == CandidateStatus.PENDING.value,
-            CandidateModel.deleted_at.is_(None),
         )
         .order_by(CandidateModel.host, CandidateModel.id)
     )
@@ -441,7 +485,6 @@ def _transition_candidates(
                 .where(
                     CandidateModel.run_id == run_id,
                     CandidateModel.status == CandidateStatus.PENDING.value,
-                    CandidateModel.deleted_at.is_(None),
                 )
                 .order_by(CandidateModel.host)
             )
@@ -464,7 +507,6 @@ def _transition_candidates(
                 select(CandidateModel).where(
                     CandidateModel.run_id == run_id,
                     CandidateModel.host.in_(requested_hosts),
-                    CandidateModel.deleted_at.is_(None),
                 )
             )
         }
@@ -530,55 +572,6 @@ def reject_candidates(
     )
 
 
-def delete_candidates(
-    run_id: int,
-    session: Session,
-    *,
-    hosts: Sequence[str],
-) -> CandidateTransitionResult:
-    """Exclui logicamente candidatos pendentes, preservando o registro auditável."""
-    _require_run(run_id, session)
-    patterns = _scope_patterns(session)
-    requested_hosts = _normalize_requested_hosts(hosts)
-    if not requested_hosts:
-        raise InputError("selecione ao menos um candidato")
-
-    outside_scope = [host for host in requested_hosts if not _is_safely_in_scope(host, patterns)]
-    if outside_scope:
-        raise InputError(f"host fora do escopo: {outside_scope[0]}")
-
-    candidates_by_host = {
-        candidate.host: candidate
-        for candidate in session.scalars(
-            select(CandidateModel).where(
-                CandidateModel.run_id == run_id,
-                CandidateModel.host.in_(requested_hosts),
-            )
-        )
-    }
-    missing = [host for host in requested_hosts if host not in candidates_by_host]
-    if missing:
-        raise InputError(f"candidato não encontrado na run {run_id}: {missing[0]}")
-
-    candidates = [candidates_by_host[host] for host in requested_hosts]
-    for candidate in candidates:
-        if candidate.deleted_at is None and candidate.status != CandidateStatus.PENDING.value:
-            raise InputError(f"somente candidatos pendentes podem ser excluídos: {candidate.host}")
-
-    now = datetime.now(UTC)
-    changed = 0
-    unchanged = 0
-    for candidate in candidates:
-        if candidate.deleted_at is not None:
-            unchanged += 1
-            continue
-        candidate.deleted_at = now
-        changed += 1
-
-    session.commit()
-    return CandidateTransitionResult(changed=changed, unchanged=unchanged)
-
-
 def export_assets(
     run_id: int,
     session: Session,
@@ -594,7 +587,6 @@ def export_assets(
             select(CandidateModel).where(
                 CandidateModel.run_id == run_id,
                 CandidateModel.status == CandidateStatus.APPROVED.value,
-                CandidateModel.deleted_at.is_(None),
             )
         )
         if _is_safely_in_scope(candidate.host, patterns)
@@ -612,26 +604,34 @@ def sanitize_run(run_id: int, session: Session) -> SanitizeResult:
     run = _require_run(run_id, session)
 
     patterns = _scope_patterns(session)
+    approved_hosts = {
+        host
+        for host in session.scalars(
+            select(CandidateModel.host).where(
+                CandidateModel.run_id == run_id,
+                CandidateModel.status == CandidateStatus.APPROVED.value,
+            )
+        )
+        if _is_safely_in_scope(host, patterns)
+    }
     existing_domains = set(
         session.scalars(select(AssetModel.domain).where(AssetModel.run_id == run_id))
-    )
-    approved_hosts = session.scalars(
-        select(CandidateModel.host).where(
-            CandidateModel.run_id == run_id,
-            CandidateModel.status == CandidateStatus.APPROVED.value,
-            CandidateModel.deleted_at.is_(None),
-        )
     )
     session.add_all(
         AssetModel(run_id=run_id, domain=host, status=AssetStatus.INGESTED.value)
         for host in approved_hosts
-        if host not in existing_domains and _is_safely_in_scope(host, patterns)
+        if host not in existing_domains
     )
     session.flush()
 
     assets = list(
         session.scalars(
-            select(AssetModel).where(AssetModel.run_id == run_id).order_by(AssetModel.id)
+            select(AssetModel)
+            .where(
+                AssetModel.run_id == run_id,
+                AssetModel.domain.in_(approved_hosts),
+            )
+            .order_by(AssetModel.id)
         )
     )
     queued_asset_ids = set(
@@ -643,7 +643,7 @@ def sanitize_run(run_id: int, session: Session) -> SanitizeResult:
 
     for asset in assets:
         if asset.status != AssetStatus.SANITIZED.value:
-            # Somente candidatos aprovados ou assets legados já validados chegam aqui.
+            # O conjunto elegível deriva exclusivamente de candidatos aprovados.
             asset.status = AssetStatus.SANITIZED.value
             asset.sanitized_at = now
             sanitized_count += 1
@@ -806,15 +806,25 @@ def prepare_triage(
         session.scalars(
             select(AssetModel)
             .join(QueueItemModel, QueueItemModel.asset_id == AssetModel.id)
+            .join(
+                CandidateModel,
+                and_(
+                    CandidateModel.run_id == AssetModel.run_id,
+                    CandidateModel.host == AssetModel.domain,
+                ),
+            )
             .where(
                 QueueItemModel.run_id == run_id,
                 QueueItemModel.status == QueueStatus.PENDING.value,
                 AssetModel.run_id == run_id,
                 AssetModel.status == AssetStatus.SANITIZED.value,
                 AssetModel.sanitized_at.is_not(None),
+                CandidateModel.status == CandidateStatus.APPROVED.value,
             )
         ).all()
     )
+    patterns = _scope_patterns(session)
+    assets = [asset for asset in assets if _is_safely_in_scope(asset.domain, patterns)]
     if not assets:
         raise InputError(f"run {run_id} não possui itens sanitizados e pendentes")
 

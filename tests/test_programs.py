@@ -142,41 +142,50 @@ def test_commands_fail_with_required_message_without_active_program(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setenv("BB_DB_PATH", str(tmp_path / "legacy.db"))
+    Path("scope.txt").write_text("*.example.com\n", encoding="utf-8")
+    Path("assets.jsonl").write_text('{"domain":"api.example.com"}\n', encoding="utf-8")
     runner = CliRunner()
-    result = runner.invoke(app, ["queue", "list"])
+    commands = [
+        ["scope", "import", "scope.txt"],
+        ["run", "ingest", "assets.jsonl"],
+        ["recon", "passive", "--dry-run"],
+        ["candidates", "list", "1"],
+        ["candidates", "approve", "1", "--all"],
+        ["candidates", "reject", "1", "--host", "api.example.com"],
+        ["assets", "export", "1"],
+        ["sanitize", "1"],
+        ["triage", "1", "--dry-run"],
+        ["queue", "list"],
+    ]
+    results = [runner.invoke(app, command) for command in commands]
     shown = runner.invoke(app, ["program", "show"])
 
-    assert result.exit_code == 1
-    assert result.output.strip() == NO_ACTIVE_PROGRAM_MESSAGE
+    assert all(result.exit_code == 1 for result in results)
+    assert all(result.output.strip() == NO_ACTIVE_PROGRAM_MESSAGE for result in results)
     assert shown.exit_code == 1
     assert shown.output.strip() == NO_ACTIVE_PROGRAM_MESSAGE
     assert not (tmp_path / "legacy.db").exists()
 
 
-def test_program_databases_and_run_artifacts_are_isolated(monkeypatch) -> None:
+def test_program_databases_and_run_artifacts_are_isolated() -> None:
     alpha = create_program("alpha", "Alpha")
     beta = create_program("beta", "Beta")
     Path("alpha-scope.txt").write_text("*.alpha.test\n", encoding="utf-8")
     Path("beta-scope.txt").write_text("*.beta.test\n", encoding="utf-8")
     Path("alpha.jsonl").write_text('{"domain":"api.alpha.test"}\n', encoding="utf-8")
     Path("beta.jsonl").write_text('{"domain":"api.beta.test"}\n', encoding="utf-8")
-    monkeypatch.setattr(
-        cli,
-        "select_checkboxes",
-        lambda title, items: [item.value for item in items],
-    )
     runner = CliRunner()
 
     select_program("alpha")
     alpha_scope = runner.invoke(app, ["scope", "import", "alpha-scope.txt"])
     assert runner.invoke(app, ["run", "ingest", "alpha.jsonl"]).exit_code == 0
-    assert runner.invoke(app, ["candidates", "approve", "1"]).exit_code == 0
+    assert runner.invoke(app, ["candidates", "approve", "1", "--all"]).exit_code == 0
     assert runner.invoke(app, ["assets", "export", "1"]).exit_code == 0
 
     select_program("beta")
     beta_scope = runner.invoke(app, ["scope", "import", "beta-scope.txt"])
     assert runner.invoke(app, ["run", "ingest", "beta.jsonl"]).exit_code == 0
-    assert runner.invoke(app, ["candidates", "approve", "1"]).exit_code == 0
+    assert runner.invoke(app, ["candidates", "approve", "1", "--all"]).exit_code == 0
     assert runner.invoke(app, ["assets", "export", "1"]).exit_code == 0
 
     assert "Program: alpha" in alpha_scope.output

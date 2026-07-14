@@ -122,24 +122,28 @@ Veja quais raízes wildcard poderiam ser enumeradas, sem subprocesso e sem tráf
 bb recon passive --dry-run
 ```
 
-Para executar a descoberta, confirme explicitamente:
+Para criar a run e executar a descoberta autorizada, confirme explicitamente pela própria flag:
 
 ```bash
 bb recon passive --confirm
 ```
 
-Antes de criar a run, a CLI mostra todas as raízes e pede uma segunda confirmação `s/N`. Responder
-“não” cancela sem executar subprocessos. Após a confirmação, o comando executa somente
-`subfinder -silent -duc`, passando as raízes autorizadas por `-d`. Não habilita modo ativo,
-resolução DNS, HTTP contra os hosts, port scan, crawler, ffuf, nuclei ou qualquer outra ferramenta.
-Se o binário não estiver no `PATH`, a CLI explica que ele deve ser instalado manualmente e não
-tenta instalar nada.
+`--confirm` é a autorização explícita e não abre uma segunda pergunta. O comando executa somente
+`subfinder -silent -duc`, passando por `-d` as raízes que tenham uma regra wildcard. Não habilita
+modo ativo, resolução DNS, HTTP contra os hosts, port scan, crawler, ffuf, nuclei ou qualquer outra
+ferramenta. Se houver wildcard e o binário não estiver no `PATH`, a CLI explica que ele deve ser
+instalado manualmente e não tenta instalar nada.
 
-A saída anterior ao filtro de escopo fica em
+Regras exatas não são enviadas ao subfinder: cada uma gera diretamente um candidato pendente com
+fonte `scope_exact`. Assim, uma run que tenha somente regras exatas não procura nem executa o
+binário. Se um host exato também aparecer na saída do subfinder, a fonte `scope_exact` prevalece e
+o host continua único na run.
+
+A saída validada e já filtrada pelo escopo fica em
 `.bb/programs/<slug>/runs/<run-id>/raw/subfinder.txt`. Por segurança,
-somente linhas que sejam hostnames válidos podem ser persistidas nesse arquivo; URLs, IPs e outras
-linhas inesperadas são descartados. Cada hostname é normalizado e deduplicado e volta a passar
-pelo escopo default-deny. Resultados fora do escopo nunca entram em `candidates`.
+somente hostnames válidos e em escopo podem ser persistidos nesse arquivo. Cada linha é normalizada
+e deduplicada. URLs, IPs, linhas inesperadas e hosts fora do escopo são descartados sem aparecer em
+`candidates` ou na listagem.
 
 ### 3. Aprove ou rejeite candidatos
 
@@ -149,19 +153,18 @@ Liste somente os candidatos pendentes e em escopo:
 bb candidates list 1
 ```
 
-A descoberta nunca cria assets automaticamente. Uma ação humana explícita é obrigatória. Cada
-comando abre um checklist no terminal, sem exigir a digitação de hosts:
+A descoberta nunca cria assets automaticamente. Uma ação humana explícita é obrigatória. Aprove
+todos os pendentes em escopo ou informe um ou mais hosts repetindo `--host`:
 
 ```bash
-bb candidates approve 1
-bb candidates reject 1
-bb candidates delete 1
+bb candidates approve 1 --all
+bb candidates approve 1 --host api.example.com --host dev.example.com
+bb candidates reject 1 --host old.example.com --host legacy.example.com
 ```
 
-Use `↑`/`↓` para mover, `Espaço` para marcar, `a` para selecionar todos, `n` para desmarcar todos,
-`Enter` para confirmar ou `q` para cancelar. Aprovação e rejeição preservam estados terminais. A
-exclusão aceita múltiplos itens, pede confirmação adicional e é lógica: o candidato deixa de
-aparecer e nunca vira asset, mas `deleted_at` preserva o histórico auditável no SQLite.
+Aprovação e rejeição são idempotentes: repetir a mesma decisão não altera o timestamp nem cria
+registros duplicados. Os estados aprovados e rejeitados são terminais, preservando no SQLite o
+host, a fonte, o estado, a criação e o momento da aprovação para auditoria.
 
 ### 4. Exporte os assets aprovados
 
@@ -196,9 +199,9 @@ Cada linha deve ter **somente** o campo `domain`:
 ```
 
 A ingestão aplica a mesma normalização, filtro e deduplicação. Ela cria uma nova run com
-**candidatos pendentes**, nunca assets aprovados. Portanto, depois dela também é obrigatório abrir
-um dos checklists de `candidates approve`, `candidates reject` ou `candidates delete`. Campos
-extras são recusados para evitar HTTP bruto, headers, cookies, tokens, query strings ou PII.
+**candidatos pendentes**, nunca assets aprovados. Portanto, depois dela também é obrigatório usar
+`candidates approve` ou `candidates reject`. Campos extras são recusados para evitar HTTP bruto,
+headers, cookies, tokens, query strings ou PII.
 
 Cada execução de `run ingest` cria uma nova run. A CLI mostra seu ID, por exemplo:
 
@@ -223,7 +226,7 @@ bb queue list
 
 ### 7. Prepare a triagem em modo local
 
-Somente itens pendentes associados a assets sanitizados entram nos lotes:
+Somente itens pendentes associados a assets sanitizados e a candidatos aprovados entram nos lotes:
 
 ```bash
 bb triage 1 --dry-run
@@ -317,6 +320,7 @@ Com o ambiente virtual ativo:
 ruff format --check .
 ruff check .
 pytest
+python -m compileall -q src tests
 ```
 
 Para aplicar a formatação automaticamente:
