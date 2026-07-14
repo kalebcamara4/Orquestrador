@@ -1,0 +1,21 @@
+{
+  "batch_id": "0001",
+  "items": [
+    {
+      "asset_id": "asset-a379a6f6eeafb9a55e378c118034e2751e682fab9f2d30ab13d2125586ce1947",
+      "host": "example.com",
+      "paths": [],
+      "status": null,
+      "technologies": [],
+      "title": null
+    },
+    {
+      "asset_id": "asset-d0c43d3885064d9aeb470214a914a43baec40e1d66dbd46375136b6ac15d2e63",
+      "host": "api.example.com",
+      "paths": [],
+      "status": null,
+      "technologies": [],
+      "title": null
+    }
+  ]
+}

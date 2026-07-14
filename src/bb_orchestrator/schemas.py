@@ -25,6 +25,7 @@ def utc_now() -> datetime:
 
 class RunStatus(StrEnum):
     INGESTED = "ingested"
+    DISCOVERED = "discovered"
     SANITIZED = "sanitized"
 
 
@@ -35,6 +36,12 @@ class AssetStatus(StrEnum):
 
 class QueueStatus(StrEnum):
     PENDING = "pending"
+
+
+class CandidateStatus(StrEnum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
 
 
 class Schema(BaseModel):

@@ -1,13 +1,16 @@
 # BB Orchestrator — MVP local
 
 CLI local para organizar ativos de programas de bug bounty **explicitamente autorizados**.
-Esta etapa prepara lotes determinísticos para triagem futura, mas não faz requisições de rede,
-não executa ferramentas contra alvos e não integra modelos de linguagem.
+Esta etapa acrescenta descoberta passiva com aprovação humana obrigatória. Somente
+`bb recon passive --confirm` pode executar uma ferramenta externa: o `subfinder`, em modo
+passivo. Nenhum comando consulta por DNS, HTTP ou scan os hosts descobertos, e não há integração
+com modelos de linguagem.
 
 ## Requisitos
 
 - Linux
 - Python 3.12 ou superior
+- `subfinder` no `PATH` (opcional; necessário somente para `recon passive --confirm`)
 - VS Code (opcional)
 
 ## Instalação
@@ -32,25 +35,11 @@ interpretador `.venv`, habilita a descoberta dos testes pytest e usa Ruff para f
 
 ## Uso passo a passo
 
-### Antes de começar: escopo não é ingestão
-
-Os dois comandos recebem domínios, mas têm responsabilidades diferentes:
-
-| Comando | Arquivo de entrada | O que representa | O que grava |
-| --- | --- | --- | --- |
-| `bb scope import scope.txt` | Regras como `example.com` e `*.example.com` | O perímetro que o programa autorizou | Regras reutilizáveis em `scope_rules` |
-| `bb run ingest assets.jsonl` | Hosts concretos como `api.example.com` | Ativos observados que você quer processar agora | Uma nova run e somente os assets autorizados |
-
-Em outras palavras, `scope import` responde **“o que posso aceitar?”** e `run ingest` responde
-**“quais ativos encontrei nesta coleta?”**. A ingestão sempre consulta o escopo já importado. Um
-domínio fora dele é recusado e não vira asset.
-
-O fluxo completo é:
+O fluxo seguro é:
 
 ```text
-scope.txt ──> scope import ──> regras autorizadas
-                                  │
-assets.jsonl ──> run ingest ──────┘──> run ──> sanitize ──> fila ──> triage
+scope import → recon passivo → candidatos em escopo → aprovação humana
+             → assets export → sanitize → fila → triage --dry-run
 ```
 
 ### 1. Importe o escopo autorizado
@@ -70,16 +59,89 @@ Importe as regras:
 bb scope import scope.txt
 ```
 
-- `example.com` autoriza somente o domínio exato.
-- `*.example.com` autoriza subdomínios como `api.example.com`, mas não o domínio raiz.
+- `example.com` autoriza somente o domínio exato e **não** autoriza enumeração.
+- `*.example.com` é a única forma que autoriza enumerar a raiz `example.com`; ela aceita
+  subdomínios como `api.example.com`, mas não o domínio raiz.
 - Comparações usam limites de rótulos DNS. Por isso, `example.com.attacker.test` e
   `notexample.com` são recusados.
 - URLs, portas, credenciais, IPs, wildcards em outras posições e domínios inválidos são recusados.
 
-### 2. Faça uma ingestão local
+`scope import` define o que foi autorizado. Descoberta, aprovação e exportação nunca ampliam esse
+perímetro.
 
-Agora crie `assets.jsonl` com os hosts concretos obtidos de uma fonte local autorizada. Cada linha
-deve ter **somente** o campo `domain`:
+### 2. Confira ou execute a descoberta passiva
+
+Veja quais raízes wildcard poderiam ser enumeradas, sem subprocesso e sem tráfego de rede:
+
+```bash
+bb recon passive --dry-run
+```
+
+Para executar a descoberta, confirme explicitamente:
+
+```bash
+bb recon passive --confirm
+```
+
+Antes de criar a run, a CLI mostra todas as raízes e pede uma segunda confirmação `s/N`. Responder
+“não” cancela sem executar subprocessos. Após a confirmação, o comando executa somente
+`subfinder -silent -duc`, passando as raízes autorizadas por `-d`. Não habilita modo ativo,
+resolução DNS, HTTP contra os hosts, port scan, crawler, ffuf, nuclei ou qualquer outra ferramenta.
+Se o binário não estiver no `PATH`, a CLI explica que ele deve ser instalado manualmente e não
+tenta instalar nada.
+
+A saída anterior ao filtro de escopo fica em `runs/<run-id>/raw/subfinder.txt`. Por segurança,
+somente linhas que sejam hostnames válidos podem ser persistidas nesse arquivo; URLs, IPs e outras
+linhas inesperadas são descartados. Cada hostname é normalizado e deduplicado e volta a passar
+pelo escopo default-deny. Resultados fora do escopo nunca entram em `candidates`.
+
+### 3. Aprove ou rejeite candidatos
+
+Liste somente os candidatos pendentes e em escopo:
+
+```bash
+bb candidates list 1
+```
+
+A descoberta nunca cria assets automaticamente. Uma ação humana explícita é obrigatória. Cada
+comando abre um checklist no terminal, sem exigir a digitação de hosts:
+
+```bash
+bb candidates approve 1
+bb candidates reject 1
+bb candidates delete 1
+```
+
+Use `↑`/`↓` para mover, `Espaço` para marcar, `a` para selecionar todos, `n` para desmarcar todos,
+`Enter` para confirmar ou `q` para cancelar. Aprovação e rejeição preservam estados terminais. A
+exclusão aceita múltiplos itens, pede confirmação adicional e é lógica: o candidato deixa de
+aparecer e nunca vira asset, mas `deleted_at` preserva o histórico auditável no SQLite.
+
+### 4. Exporte os assets aprovados
+
+```bash
+bb assets export 1
+```
+
+Somente candidatos aprovados e ainda em escopo são gravados, em ordem determinística, em
+`runs/<run-id>/assets.jsonl`:
+
+```jsonl
+{"domain":"api.example.com"}
+```
+
+Uma nova exportação sobrescreve apenas esse arquivo da run. Candidatos pendentes, rejeitados ou
+fora do escopo não aparecem.
+
+### Entrada manual e de teste
+
+`bb run ingest` continua disponível para hosts obtidos de uma fonte local autorizada:
+
+```bash
+bb run ingest entrada.jsonl
+```
+
+Cada linha deve ter **somente** o campo `domain`:
 
 ```jsonl
 {"domain":"example.com"}
@@ -87,15 +149,10 @@ deve ter **somente** o campo `domain`:
 {"domain":"third-party.test"}
 ```
 
-Execute:
-
-```bash
-bb run ingest assets.jsonl
-```
-
-A ingestão aplica normalização, filtro de escopo e deduplicação em Python determinístico. Ativos
-fora do escopo são contados e descartados; não entram no SQLite. Campos extras são recusados para
-evitar a ingestão acidental de HTTP bruto, headers, cookies, tokens, query strings ou PII.
+A ingestão aplica a mesma normalização, filtro e deduplicação. Ela cria uma nova run com
+**candidatos pendentes**, nunca assets aprovados. Portanto, depois dela também é obrigatório abrir
+um dos checklists de `candidates approve`, `candidates reject` ou `candidates delete`. Campos
+extras são recusados para evitar HTTP bruto, headers, cookies, tokens, query strings ou PII.
 
 Cada execução de `run ingest` cria uma nova run. A CLI mostra seu ID, por exemplo:
 
@@ -103,27 +160,22 @@ Cada execução de `run ingest` cria uma nova run. A CLI mostra seu ID, por exem
 Run 1: aceitos=2, rejeitados=1, duplicados=0.
 ```
 
-Guarde esse número para `sanitize` e `triage`. Se fechar o terminal, ele pode ser consultado na
-coluna `RUN` de `bb queue list` depois que a run tiver sido sanitizada.
-
-### 3. Sanitize a run
-
-Use o identificador exibido pela ingestão:
+### 5. Sanitize a run
 
 ```bash
 bb sanitize 1
 ```
 
-Nesta etapa, sanitizar significa promover apenas os domínios canônicos já validados e criar
+Sanitizar materializa somente candidatos aprovados e ainda em escopo como assets canônicos e cria
 referências na fila. A operação é idempotente e a fila não contém payload bruto.
 
-### 4. Consulte a fila
+### 6. Consulte a fila
 
 ```bash
 bb queue list
 ```
 
-### 5. Prepare a triagem em modo local
+### 7. Prepare a triagem em modo local
 
 Somente itens pendentes associados a assets sanitizados entram nos lotes:
 
@@ -204,9 +256,9 @@ export BB_DB_PATH=/caminho/local/orchestrator.db
 bb queue list
 ```
 
-O SQLite é persistente: fechar o terminal não apaga regras, runs, assets ou itens da fila. Ao abrir
-outro terminal no mesmo diretório, a CLI volta a usar `.bb/orchestrator.db`. Uma nova ingestão cria
-uma nova run; ela não reinicia a numeração anterior.
+O SQLite é persistente: fechar o terminal não apaga regras, runs, candidatos, assets ou itens da
+fila. Ao abrir outro terminal no mesmo diretório, a CLI volta a usar `.bb/orchestrator.db`. Uma
+nova descoberta ou ingestão cria uma nova run; ela não reinicia a numeração anterior.
 
 Para fazer uma demonstração isolada sem reutilizar o banco padrão, escolha outro arquivo antes de
 executar os comandos:
@@ -215,12 +267,13 @@ executar os comandos:
 export BB_DB_PATH=.bb/demo.db
 ```
 
-As tabelas são `scope_rules`, `runs`, `assets` e `queue_items`. O banco armazena regras, domínios
-normalizados, estados, contadores, referências e o SHA-256 do arquivo de entrada. O conteúdo bruto
-do JSONL e seu caminho não são persistidos.
+As tabelas são `scope_rules`, `runs`, `candidates`, `assets` e `queue_items`. O banco armazena
+regras, hosts normalizados, fonte, estados, timestamps de criação/aprovação/exclusão, contadores,
+referências e hashes SHA-256. O conteúdo bruto e o caminho do JSONL manual não são persistidos.
+A saída segura do subfinder existe somente no arquivo `runs/<run-id>/raw/subfinder.txt`.
 
-Não coloque API keys em código, arquivos JSON/JSONL ou SQLite. Este MVP não lê nem utiliza API
-keys.
+Não coloque API keys em código, arquivos JSON/JSONL ou SQLite. O orquestrador não lê, grava ou
+gerencia credenciais de provedores do subfinder.
 
 ## Qualidade
 
@@ -242,5 +295,6 @@ ruff format .
 
 - Sem LLMs, LiteLLM, DeepSeek ou GPT-OSS.
 - Sem GUI, servidor web ou Docker.
-- Sem scanners, clientes HTTP, resolução DNS ou qualquer tráfego contra alvos.
+- A única descoberta automática é o subfinder passivo, após `--confirm`; sem dnsx, httpx, port
+  scan, crawler, ffuf, nuclei ou tráfego DNS/HTTP contra os hosts descobertos.
 - Sem processamento de requisições/respostas HTTP brutas ou segredos.

@@ -10,9 +10,15 @@ from bb_orchestrator.database import (
     create_sqlite_engine,
     initialize_database,
 )
-from bb_orchestrator.models import AssetModel
-from bb_orchestrator.schemas import IngestRecord
-from bb_orchestrator.services import import_scope_file, ingest_jsonl, list_queue, sanitize_run
+from bb_orchestrator.models import AssetModel, CandidateModel
+from bb_orchestrator.schemas import CandidateStatus, IngestRecord
+from bb_orchestrator.services import (
+    approve_candidates,
+    import_scope_file,
+    ingest_jsonl,
+    list_queue,
+    sanitize_run,
+)
 
 
 @pytest.fixture
@@ -23,15 +29,38 @@ def session(tmp_path: Path):
         yield db_session
 
 
-def test_database_contains_the_four_corresponding_tables(tmp_path: Path) -> None:
+def test_database_contains_the_five_corresponding_tables(tmp_path: Path) -> None:
     engine = create_sqlite_engine(tmp_path / "tables.db")
     initialize_database(engine)
     assert set(inspect(engine).get_table_names()) == {
         "assets",
+        "candidates",
         "queue_items",
         "runs",
         "scope_rules",
     }
+
+
+def test_database_adds_deleted_at_to_existing_candidates_table(tmp_path: Path) -> None:
+    engine = create_sqlite_engine(tmp_path / "migration.db")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE candidates (
+                id INTEGER PRIMARY KEY,
+                run_id INTEGER NOT NULL,
+                host VARCHAR(253) NOT NULL,
+                source VARCHAR(32) NOT NULL,
+                status VARCHAR(16) NOT NULL,
+                created_at DATETIME NOT NULL,
+                approved_at DATETIME
+            )
+            """
+        )
+
+    initialize_database(engine)
+
+    assert "deleted_at" in {column["name"] for column in inspect(engine).get_columns("candidates")}
 
 
 def test_ingest_filters_scope_deduplicates_and_sanitize_queues(tmp_path: Path, session) -> None:
@@ -51,13 +80,20 @@ def test_ingest_filters_scope_deduplicates_and_sanitize_queues(tmp_path: Path, s
     run = ingest_jsonl(input_file, session)
 
     assert (run.accepted_count, run.rejected_count, run.duplicate_count) == (2, 1, 1)
+    candidates = list(session.scalars(select(CandidateModel).order_by(CandidateModel.host)))
+    assert [(item.host, item.source, item.status) for item in candidates] == [
+        ("api.example.com", "ingest", CandidateStatus.PENDING.value),
+        ("example.com", "ingest", CandidateStatus.PENDING.value),
+    ]
+    assert list(session.scalars(select(AssetModel.domain))) == []
+
+    approve_candidates(run.id, session, approve_all=True)
+    first = sanitize_run(run.id, session)
+    second = sanitize_run(run.id, session)
     assert list(session.scalars(select(AssetModel.domain).order_by(AssetModel.domain))) == [
         "api.example.com",
         "example.com",
     ]
-
-    first = sanitize_run(run.id, session)
-    second = sanitize_run(run.id, session)
     assert (first.sanitized, first.queued) == (2, 2)
     assert (second.sanitized, second.queued) == (0, 0)
     assert len(list_queue(session)) == 2

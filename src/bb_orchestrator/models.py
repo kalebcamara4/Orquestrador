@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, String, UniqueConstraint
+from sqlalchemy import CheckConstraint, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -44,6 +44,26 @@ class AssetModel(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
     sanitized_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+
+class CandidateModel(Base):
+    __tablename__ = "candidates"
+    __table_args__ = (
+        UniqueConstraint("run_id", "host", name="uq_candidate_run_host"),
+        CheckConstraint(
+            "status IN ('pending', 'approved', 'rejected')",
+            name="ck_candidate_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("runs.id"), nullable=False, index=True)
+    host: Mapped[str] = mapped_column(String(253), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    approved_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
 
 class QueueItemModel(Base):

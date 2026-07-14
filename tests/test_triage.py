@@ -7,6 +7,7 @@ import pytest
 from pydantic import ValidationError
 from typer.testing import CliRunner
 
+import bb_orchestrator.cli as cli
 import bb_orchestrator.services as services
 from bb_orchestrator.cli import app
 from bb_orchestrator.database import (
@@ -352,6 +353,12 @@ def test_cli_dry_run_end_to_end(tmp_path: Path, monkeypatch) -> None:
 
     assert runner.invoke(app, ["scope", "import", "scope.txt"], env=env).exit_code == 0
     assert runner.invoke(app, ["run", "ingest", "assets.jsonl"], env=env).exit_code == 0
+    monkeypatch.setattr(
+        cli,
+        "select_checkboxes",
+        lambda title, items: [item.value for item in items],
+    )
+    assert runner.invoke(app, ["candidates", "approve", "1"], env=env).exit_code == 0
     assert runner.invoke(app, ["sanitize", "1"], env=env).exit_code == 0
     result = runner.invoke(app, ["triage", "1", "--dry-run"], env=env)
 
