@@ -1,9 +1,79 @@
-.venv/
+# Dados e artefatos locais do BB Orchestrator
 .bb/
-.pytest_cache/
-.ruff_cache/
+runs/
+/scope.txt
+/entrada.jsonl
+/assets.jsonl
+
+# SQLite e arquivos auxiliares do banco
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Ambientes virtuais e configuração local/secreta
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# Bytecode e caches de ferramentas Python
 __pycache__/
 *.py[cod]
-*.db
-*.sqlite3
-runs/
+*$py.class
+.cache/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.pytype/
+.hypothesis/
+.tox/
+.nox/
+
+# Cobertura e relatórios de testes
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+junit.xml
+
+# Build e empacotamento Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+
+# Logs, temporários e backups locais
+*.log
+*.pid
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# Metadados locais de sistema operacional e editores
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.history/
+.agents/
+.codex/
