@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, ForeignKey, String, UniqueConstraint
+from sqlalchemy import CheckConstraint, ForeignKey, Index, String, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -73,6 +73,30 @@ class CandidateModel(Base):
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
     approved_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+
+class DnsVerificationAttemptModel(Base):
+    __tablename__ = "dns_verification_attempts"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'resolved', 'unresolved')",
+            name="ck_dns_verification_status",
+        ),
+        Index("ix_dns_attempt_candidate_latest", "candidate_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("runs.id"), nullable=False, index=True)
+    candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("candidates.id"), nullable=False, index=True
+    )
+    program_slug: Mapped[str] = mapped_column(
+        String(64), ForeignKey("programs.slug"), nullable=False, index=True
+    )
+    host: Mapped[str] = mapped_column(String(253), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    verified_at: Mapped[datetime] = mapped_column(nullable=False)
+    dnsx_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class QueueItemModel(Base):

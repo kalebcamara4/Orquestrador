@@ -153,6 +153,8 @@ def test_commands_fail_with_required_message_without_active_program(
         ["candidates", "approve", "1", "--all"],
         ["candidates", "reject", "1", "--host", "api.example.com"],
         ["assets", "export", "1"],
+        ["assets", "list", "1"],
+        ["verify", "dns", "1", "--dry-run"],
         ["sanitize", "1"],
         ["triage", "1", "--dry-run"],
         ["queue", "list"],

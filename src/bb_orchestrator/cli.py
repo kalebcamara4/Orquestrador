@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 from typing import Annotated
 
@@ -30,13 +31,16 @@ from bb_orchestrator.services import (
     export_assets,
     import_scope_file,
     ingest_jsonl,
+    list_assets_with_dns,
     list_candidates,
     list_queue,
     passive_recon_roots,
+    plan_dns_verification,
     prepare_triage,
     reject_candidates,
     run_passive_recon,
     sanitize_run,
+    verify_dns,
 )
 
 app = typer.Typer(name="bb", help="Orquestrador local para bug bounty autorizado.")
@@ -45,7 +49,8 @@ run_app = typer.Typer(help="Gerencia execuções locais de ingestão.")
 queue_app = typer.Typer(help="Consulta a fila local sanitizada.")
 recon_app = typer.Typer(help="Executa descoberta estritamente passiva.")
 candidates_app = typer.Typer(help="Gerencia a aprovação humana de candidatos.")
-assets_app = typer.Typer(help="Exporta assets aprovados.")
+assets_app = typer.Typer(help="Consulta e exporta assets aprovados.")
+verify_app = typer.Typer(help="Executa verificações ativas estritamente limitadas.")
 program_app = typer.Typer(help="Gerencia programas isolados.")
 app.add_typer(scope_app, name="scope")
 app.add_typer(run_app, name="run")
@@ -53,6 +58,7 @@ app.add_typer(queue_app, name="queue")
 app.add_typer(recon_app, name="recon")
 app.add_typer(candidates_app, name="candidates")
 app.add_typer(assets_app, name="assets")
+app.add_typer(verify_app, name="verify")
 app.add_typer(program_app, name="program")
 
 InputFile = Annotated[
@@ -309,6 +315,63 @@ def assets_export(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
         except InputError as exc:
             _abort(str(exc))
     typer.echo(f"Run {run_id}: assets exportados={result.exported}; arquivo={result.path}.")
+
+
+@assets_app.command("list")
+def assets_list(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
+    """Lista aprovação e último estado DNS de todos os candidatos da run."""
+    session, program = _program_session()
+    with session:
+        try:
+            assets = list_assets_with_dns(run_id, session, program_slug=program.slug)
+        except InputError as exc:
+            _abort(str(exc))
+    if not assets:
+        typer.echo("Nenhum candidato nesta run.")
+        return
+    typer.echo("HOST  APROVAÇÃO  DNS")
+    for asset in assets:
+        typer.echo(f"{asset.host}  {asset.approval_status}  {asset.dns_status}")
+
+
+@verify_app.command("dns")
+def verify_dns_command(
+    run_id: Annotated[int, typer.Argument(min=1)],
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Mostra o plano sem subprocesso, arquivo ou rede."),
+    ] = False,
+    confirm: Annotated[
+        bool,
+        typer.Option("--confirm", help="Autoriza explicitamente a execução limitada do dnsx."),
+    ] = False,
+) -> None:
+    """Verifica por DNS somente candidatos aprovados da run informada."""
+    session, program = _program_session()
+    with session:
+        if dry_run == confirm:
+            _abort("informe exatamente uma opção: --dry-run ou --confirm")
+        try:
+            if dry_run:
+                plan = plan_dns_verification(run_id, session, runs_path=program.runs_path)
+                typer.echo(f"Hosts aprovados: {plan.host_count}")
+                typer.echo(f"Limites: threads={plan.threads}; DNS/s={plan.rate_limit}")
+                typer.echo(f"Comando planejado: {shlex.join(plan.command)}")
+                return
+            result = verify_dns(
+                run_id,
+                session,
+                program_slug=program.slug,
+                runs_path=program.runs_path,
+            )
+        except InputError as exc:
+            _abort(str(exc))
+    typer.echo(
+        f"Run {run_id}: verificados={result.attempted}, resolvidos={result.resolved}, "
+        f"não resolvidos={result.unresolved}."
+    )
+    typer.echo(f"Entrada: {result.input_path}")
+    typer.echo(f"Resolvidos: {result.resolved_path}")
 
 
 @app.command("sanitize")

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from bb_orchestrator.domain import (
@@ -28,6 +28,7 @@ from bb_orchestrator.domain import (
 from bb_orchestrator.models import (
     AssetModel,
     CandidateModel,
+    DnsVerificationAttemptModel,
     QueueItemModel,
     RunModel,
     ScopeRuleModel,
@@ -35,6 +36,7 @@ from bb_orchestrator.models import (
 from bb_orchestrator.schemas import (
     AssetStatus,
     CandidateStatus,
+    DnsStatus,
     IngestRecord,
     QueueStatus,
     RunStatus,
@@ -48,6 +50,9 @@ DEFAULT_TRIAGE_BATCH_SIZE = 10
 MAX_TRIAGE_BATCH_SIZE = 20
 DEFAULT_RUNS_PATH = Path("runs")
 SUBFINDER_TIMEOUT_SECONDS = 300
+DNSX_TIMEOUT_SECONDS = 300
+DNSX_THREADS = 5
+DNSX_RATE_LIMIT = 5
 
 _URL_PATTERN = re.compile(r"(?i)(?:\b[a-z][a-z0-9+.-]{1,20}://|\b(?:[a-z0-9-]+\.)+[a-z]{2,63}/\S*)")
 _QUERY_PATTERN = re.compile(r"(?i)(?:\?|%3f|(?:^|&)\s*[^&=\s]{1,64}=[^&\s]*)")
@@ -70,6 +75,7 @@ _EMAIL_PATTERN = re.compile(r"(?i)(?<![a-z0-9._%+-])[a-z0-9._%+-]+@[a-z0-9.-]+\.
 _PHONE_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:\+?\d[\s().-]*){8,15}(?![A-Za-z0-9])")
 _CPF_PATTERN = re.compile(r"(?<![A-Za-z0-9])\d{3}\.?\d{3}\.?\d{3}-?\d{2}(?![A-Za-z0-9])")
 _IP_CANDIDATE_PATTERN = re.compile(r"(?<![A-Za-z0-9])[\[\]0-9A-Fa-f:.%]+(?![A-Za-z0-9])")
+_DNSX_VERSION_PATTERN = re.compile(r"(?i)\bversion\s*:?\s*(v?\d+\.\d+\.\d+)\b")
 
 
 class InputError(ValueError):
@@ -114,6 +120,33 @@ class CandidateTransitionResult:
 class AssetExportResult:
     exported: int
     path: Path
+
+
+@dataclass(frozen=True)
+class DnsVerificationPlan:
+    host_count: int
+    threads: int
+    rate_limit: int
+    command: tuple[str, ...]
+    input_path: Path
+    resolved_path: Path
+
+
+@dataclass(frozen=True)
+class DnsVerificationResult:
+    attempted: int
+    resolved: int
+    unresolved: int
+    input_path: Path
+    resolved_path: Path
+    dnsx_version: str | None
+
+
+@dataclass(frozen=True)
+class AssetDnsState:
+    host: str
+    approval_status: str
+    dns_status: str
 
 
 class PolicyViolation(InputError):
@@ -598,6 +631,204 @@ def export_assets(
     output_path = runs_path / str(run_id) / "assets.jsonl"
     _write_atomic(output_path, content, "assets.jsonl")
     return AssetExportResult(exported=len(approved_hosts), path=output_path)
+
+
+def _approved_dns_candidates(run_id: int, session: Session) -> list[CandidateModel]:
+    _require_run(run_id, session)
+    patterns = _scope_patterns(session)
+    candidates = list(
+        session.scalars(
+            select(CandidateModel)
+            .where(
+                CandidateModel.run_id == run_id,
+                CandidateModel.status == CandidateStatus.APPROVED.value,
+            )
+            .order_by(CandidateModel.host, CandidateModel.id)
+        )
+    )
+    approved = [
+        candidate for candidate in candidates if _is_safely_in_scope(candidate.host, patterns)
+    ]
+    if not approved:
+        raise InputError(f"run {run_id} não possui candidatos aprovados em escopo")
+    return approved
+
+
+def _dns_verification_plan(
+    run_id: int,
+    candidates: Sequence[CandidateModel],
+    runs_path: Path,
+) -> DnsVerificationPlan:
+    dns_path = runs_path / str(run_id) / "dns"
+    input_path = dns_path / "input-hosts.txt"
+    resolved_path = dns_path / "resolved-hosts.txt"
+    command = (
+        "dnsx",
+        "-l",
+        str(input_path),
+        "-silent",
+        "-t",
+        str(DNSX_THREADS),
+        "-rl",
+        str(DNSX_RATE_LIMIT),
+    )
+    return DnsVerificationPlan(
+        host_count=len(candidates),
+        threads=DNSX_THREADS,
+        rate_limit=DNSX_RATE_LIMIT,
+        command=command,
+        input_path=input_path,
+        resolved_path=resolved_path,
+    )
+
+
+def plan_dns_verification(
+    run_id: int,
+    session: Session,
+    *,
+    runs_path: Path = DEFAULT_RUNS_PATH,
+) -> DnsVerificationPlan:
+    """Planeja a execução sem consultar binários, executar processos ou gravar arquivos."""
+    candidates = _approved_dns_candidates(run_id, session)
+    return _dns_verification_plan(run_id, candidates, runs_path)
+
+
+def _resolved_hosts_from_dnsx(stdout: str, approved_hosts: set[str]) -> list[str]:
+    resolved: set[str] = set()
+    for raw_line in stdout.splitlines():
+        try:
+            host = normalize_domain(raw_line)
+        except (InvalidDomain, ValueError):
+            continue
+        if host in approved_hosts:
+            resolved.add(host)
+    return sorted(resolved)
+
+
+def _dnsx_version(stderr: str) -> str | None:
+    match = _DNSX_VERSION_PATTERN.search(stderr)
+    return match.group(1) if match is not None else None
+
+
+def verify_dns(
+    run_id: int,
+    session: Session,
+    *,
+    program_slug: str,
+    runs_path: Path = DEFAULT_RUNS_PATH,
+) -> DnsVerificationResult:
+    """Executa somente dnsx e persiste uma tentativa mínima por candidato aprovado."""
+    candidates = _approved_dns_candidates(run_id, session)
+    plan = _dns_verification_plan(run_id, candidates, runs_path)
+    dnsx_path = shutil.which("dnsx")
+    if dnsx_path is None:
+        raise InputError(
+            "dnsx não está instalado; instale-o manualmente e adicione o binário ao PATH"
+        )
+
+    input_content = "".join(f"{candidate.host}\n" for candidate in candidates)
+    _write_atomic(plan.input_path, input_content, "a lista de entrada do dnsx")
+
+    started_at = datetime.now(UTC)
+    attempts = [
+        DnsVerificationAttemptModel(
+            run_id=run_id,
+            candidate_id=candidate.id,
+            program_slug=program_slug,
+            host=candidate.host,
+            status=DnsStatus.PENDING.value,
+            verified_at=started_at,
+            dnsx_version=None,
+        )
+        for candidate in candidates
+    ]
+    session.add_all(attempts)
+    session.commit()
+
+    command = [dnsx_path, *plan.command[1:]]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            shell=False,
+            text=True,
+            timeout=DNSX_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise InputError("não foi possível executar o dnsx") from exc
+
+    if completed.returncode != 0:
+        raise InputError(f"dnsx terminou com código {completed.returncode}")
+
+    approved_hosts = {candidate.host for candidate in candidates}
+    resolved_hosts = _resolved_hosts_from_dnsx(completed.stdout or "", approved_hosts)
+    resolved_set = set(resolved_hosts)
+    resolved_content = "".join(f"{host}\n" for host in resolved_hosts)
+    _write_atomic(plan.resolved_path, resolved_content, "a saída segura do dnsx")
+
+    checked_at = datetime.now(UTC)
+    version = _dnsx_version(completed.stderr or "")
+    for attempt in attempts:
+        attempt.status = (
+            DnsStatus.RESOLVED.value if attempt.host in resolved_set else DnsStatus.UNRESOLVED.value
+        )
+        attempt.verified_at = checked_at
+        attempt.dnsx_version = version
+    session.commit()
+
+    return DnsVerificationResult(
+        attempted=len(attempts),
+        resolved=len(resolved_hosts),
+        unresolved=len(attempts) - len(resolved_hosts),
+        input_path=plan.input_path,
+        resolved_path=plan.resolved_path,
+        dnsx_version=version,
+    )
+
+
+def list_assets_with_dns(
+    run_id: int,
+    session: Session,
+    *,
+    program_slug: str,
+) -> list[AssetDnsState]:
+    """Lista candidatos da run com o estado DNS mais recente, sem materializar assets."""
+    _require_run(run_id, session)
+    candidates = list(
+        session.scalars(
+            select(CandidateModel)
+            .where(CandidateModel.run_id == run_id)
+            .order_by(CandidateModel.host, CandidateModel.id)
+        )
+    )
+    latest_attempt_ids = (
+        select(func.max(DnsVerificationAttemptModel.id))
+        .where(
+            DnsVerificationAttemptModel.run_id == run_id,
+            DnsVerificationAttemptModel.program_slug == program_slug,
+        )
+        .group_by(DnsVerificationAttemptModel.candidate_id)
+    )
+    latest_by_candidate = {
+        attempt.candidate_id: attempt.status
+        for attempt in session.scalars(
+            select(DnsVerificationAttemptModel).where(
+                DnsVerificationAttemptModel.id.in_(latest_attempt_ids)
+            )
+        )
+    }
+    return [
+        AssetDnsState(
+            host=candidate.host,
+            approval_status=candidate.status,
+            dns_status=latest_by_candidate.get(candidate.id, DnsStatus.PENDING.value),
+        )
+        for candidate in candidates
+    ]
 
 
 def sanitize_run(run_id: int, session: Session) -> SanitizeResult:

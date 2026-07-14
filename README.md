@@ -1,16 +1,16 @@
 # BB Orchestrator — MVP local
 
 CLI local para organizar ativos de programas de bug bounty **explicitamente autorizados**.
-Esta etapa acrescenta descoberta passiva com aprovação humana obrigatória. Somente
-`bb recon passive --confirm` pode executar uma ferramenta externa: o `subfinder`, em modo
-passivo. Nenhum comando consulta por DNS, HTTP ou scan os hosts descobertos, e não há integração
-com modelos de linguagem.
+O fluxo começa com descoberta passiva e aprovação humana obrigatória. Depois da aprovação,
+esta etapa permite a primeira verificação ativa: uma resolução DNS mínima com `dnsx`. Nenhum
+comando faz HTTP, crawling, port scan, fuzzing, nuclei ou integração com modelos de linguagem.
 
 ## Requisitos
 
 - Linux
 - Python 3.12 ou superior
 - `subfinder` no `PATH` (opcional; necessário somente para `recon passive --confirm`)
+- `dnsx` no `PATH` (opcional; necessário somente para `verify dns <run-id> --confirm`)
 - VS Code (opcional)
 
 ## Instalação
@@ -71,7 +71,7 @@ bb program select
 
 Arquivar retira o programa do seletor e limpa a seleção se ele estiver ativo, mas nunca apaga seu
 banco nem seus artefatos. Sem programa ativo, comandos como `scope`, `recon`, `run`, `candidates`,
-`assets`, `sanitize`, `queue` e `triage` recusam a operação com:
+`verify`, `assets`, `sanitize`, `queue` e `triage` recusam a operação com:
 
 ```text
 Nenhum programa selecionado. Execute: bb program select
@@ -84,7 +84,7 @@ O fluxo seguro é:
 
 ```text
 scope import → recon passivo → candidatos em escopo → aprovação humana
-             → assets export → sanitize → fila → triage --dry-run
+             → verificação DNS → assets list/export → sanitize → fila → triage --dry-run
 ```
 
 ### 1. Importe o escopo autorizado
@@ -165,6 +165,59 @@ bb candidates reject 1 --host old.example.com --host legacy.example.com
 Aprovação e rejeição são idempotentes: repetir a mesma decisão não altera o timestamp nem cria
 registros duplicados. Os estados aprovados e rejeitados são terminais, preservando no SQLite o
 host, a fonte, o estado, a criação e o momento da aprovação para auditoria.
+
+### 3A. Faça a primeira verificação ativa por DNS
+
+Antes de autorizar tráfego DNS, confira o plano da run:
+
+```bash
+bb verify dns 1 --dry-run
+```
+
+O modo `--dry-run` mostra `Program: <slug>`, a quantidade de hosts aprovados, os limites e o
+comando planejado. Ele não procura nem executa o binário, não grava os arquivos DNS e não usa a
+rede. Runs inexistentes ou sem candidatos aprovados são recusadas.
+
+Para confirmar explicitamente a verificação:
+
+```bash
+bb verify dns 1 --confirm
+```
+
+Essa é a primeira verificação ativa do fluxo e executa **somente** `dnsx`, com uma lista de entrada,
+saída silenciosa, 5 threads e limite de 5 consultas DNS por segundo:
+
+```text
+dnsx -l .bb/programs/<slug>/runs/<run-id>/dns/input-hosts.txt -silent -t 5 -rl 5
+```
+
+Não são habilitadas flags de resposta, IP, ASN, CNAME, TXT, MX ou qualquer outro registro. A saída
+do processo é tratada como não confiável: somente hostnames normalizados que já estavam na lista
+aprovada podem ser gravados. IPs, respostas DNS brutas, URLs e linhas inesperadas são descartados.
+Se `dnsx` não estiver no `PATH`, a CLI pede instalação manual e nunca tenta instalá-lo.
+
+Os únicos artefatos desta etapa são:
+
+```text
+.bb/programs/<slug>/runs/<run-id>/dns/input-hosts.txt
+.bb/programs/<slug>/runs/<run-id>/dns/resolved-hosts.txt
+```
+
+O primeiro contém somente os candidatos aprovados e em escopo; o segundo, somente os hosts que
+resolveram. Ambos são ordenados e substituídos atomicamente para manter uma saída determinística.
+No SQLite, cada confirmação cria uma nova tentativa por candidato, preservando o histórico com
+host, estado `pending|resolved|unresolved`, horário, versão do dnsx quando informada pelo processo,
+run e programa. Nenhum IP ou conteúdo DNS bruto é persistido.
+
+Consulte aprovação e o estado DNS mais recente sem materializar ou alterar assets:
+
+```bash
+bb assets list 1
+```
+
+Esse comando mostra `host`, estado de aprovação e estado DNS. Um candidato ainda não verificado
+aparece como DNS `pending`. Esta etapa não altera o comportamento de `assets export`, `sanitize`
+ou `triage`.
 
 ### 4. Exporte os assets aprovados
 
@@ -303,11 +356,11 @@ Cada programa usa exclusivamente `.bb/programs/<slug>/orchestrator.db`. Fechar o
 apaga regras, runs, candidatos, assets ou itens da fila, e trocar a seleção não mistura dados entre
 programas. O arquivo `.bb/current-program.json` contém somente o slug atualmente selecionado.
 
-As tabelas incluem `programs`, `scope_rules`, `runs`, `candidates`, `assets` e `queue_items`. Cada
-banco armazena apenas os metadados e dados daquele programa: regras, hosts normalizados, fonte,
-estados, timestamps, contadores, referências e hashes SHA-256. O conteúdo bruto e o caminho do
-JSONL manual não são persistidos. A saída segura do subfinder existe somente no diretório `runs/`
-do programa ativo.
+As tabelas incluem `programs`, `scope_rules`, `runs`, `candidates`,
+`dns_verification_attempts`, `assets` e `queue_items`. Cada banco armazena apenas os metadados e
+dados daquele programa: regras, hosts normalizados, fonte, estados, timestamps, contadores,
+referências e hashes SHA-256. O conteúdo bruto e o caminho do JSONL manual não são persistidos.
+As saídas seguras do subfinder e do dnsx existem somente no diretório `runs/` do programa ativo.
 
 Não coloque API keys em código, arquivos JSON/JSONL ou SQLite. O orquestrador não lê, grava ou
 gerencia credenciais de provedores do subfinder.
@@ -333,6 +386,8 @@ ruff format .
 
 - Sem LLMs, LiteLLM, DeepSeek ou GPT-OSS.
 - Sem GUI, servidor web ou Docker.
-- A única descoberta automática é o subfinder passivo, após `--confirm`; sem dnsx, httpx, port
-  scan, crawler, ffuf, nuclei ou tráfego DNS/HTTP contra os hosts descobertos.
+- A única descoberta automática é o subfinder passivo, após `--confirm`.
+- A única verificação ativa é o dnsx limitado a 5 threads e 5 DNS/s, após aprovação humana e
+  `verify dns <run-id> --confirm`.
+- Sem httpx, port scan, crawler, ffuf, nuclei ou tráfego HTTP contra os hosts descobertos.
 - Sem processamento de requisições/respostas HTTP brutas ou segredos.

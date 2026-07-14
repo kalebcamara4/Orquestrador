@@ -44,6 +44,12 @@ class CandidateStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class DnsStatus(StrEnum):
+    PENDING = "pending"
+    RESOLVED = "resolved"
+    UNRESOLVED = "unresolved"
+
+
 class Schema(BaseModel):
     model_config = ConfigDict(extra="forbid", from_attributes=True)
 
