@@ -5,6 +5,8 @@ O fluxo começa com descoberta passiva e aprovação humana obrigatória. Depois
 ele permite três verificações ativas mínimas: resolução DNS com `dnsx`, consulta HTTP raiz com
 `httpx` e quatro portas TCP fixas com `naabu`. Não há crawling, fuzzing, nuclei ou integração com
 modelos de linguagem.
+Depois dessas verificações, um mapa local consolida os estados já persistidos sem gerar tráfego
+adicional.
 
 ## Requisitos
 
@@ -76,7 +78,8 @@ bb program select
 
 Arquivar retira o programa do seletor e limpa a seleção se ele estiver ativo, mas nunca apaga seu
 banco nem seus artefatos. Sem programa ativo, comandos como `scope`, `recon`, `run`, `candidates`,
-`policy`, `verify`, `ports`, `assets`, `sanitize`, `queue` e `triage` recusam a operação com:
+`policy`, `verify`, `ports`, `surface`, `assets`, `sanitize`, `queue` e `triage` recusam a operação
+com:
 
 ```text
 Nenhum programa selecionado. Execute: bb program select
@@ -90,6 +93,7 @@ O fluxo seguro é:
 ```text
 scope import → recon passivo → candidatos em escopo → aprovação humana
              → verificação DNS → verificação HTTP → verificação de portas
+             → mapa local da superfície
              → assets list/export
              → sanitize → fila → triage --dry-run
 ```
@@ -324,6 +328,42 @@ JSONL seguro ou na CLI. `ports.jsonl` contém somente host, porta, estado `open`
 do Naabu, run e referência ao snapshot da política. `bb ports list` exibe apenas `HOST`, `PORTA` e
 `STATUS`.
 
+### 3D. Consulte o mapa local da superfície
+
+O mapa consolida dinamicamente somente os dados seguros que já estão no SQLite do programa
+ativo. Os dois comandos são locais: não consultam o `PATH`, não iniciam subprocessos e não fazem
+DNS, HTTP, conexões de porta ou qualquer outro acesso de rede:
+
+```bash
+bb surface list 1
+bb surface export 1
+```
+
+`surface list` mostra, em ordem de hostname, aprovação, último DNS, último HTTP, status code,
+título e tecnologias HTTP sanitizados, portas abertas ordenadas e um estágio objetivo. Candidatos
+`pending` e `rejected` continuam visíveis, mas seus dados de verificações ficam ocultos. Para os
+aprovados, HTTP só é mostrado quando o último DNS está `resolved`; portas só são mostradas quando
+o último HTTP está `reachable`.
+
+O estágio consolidado segue regras fixas e não representa vulnerabilidade, criticidade ou
+exploração:
+
+- sem DNS `resolved`: `pending`;
+- DNS `resolved` e HTTP `pending|unreachable`: `dns_resolved`;
+- HTTP `reachable` sem portas registradas: `http_reachable`;
+- HTTP `reachable` com ao menos uma porta aberta registrada: `ports_observed`.
+
+O export grava atomicamente um único JSONL determinístico e substitui somente esse artefato:
+
+```text
+.bb/programs/<slug>/runs/<run-id>/surface/surface.jsonl
+```
+
+Cada linha contém os mesmos nove campos seguros da listagem. Valores ausentes usam `null` ou
+listas vazias no JSONL. IPs, URLs, headers, cookies, body, redirects, banners, versões de
+ferramentas, snapshots de política e dados brutos não são consultados nem exportados. A operação
+não cria assets e não altera candidatos, tentativas, portas, fila ou triage.
+
 ### 4. Exporte os assets aprovados
 
 ```bash
@@ -468,6 +508,8 @@ armazena apenas os metadados e dados daquele programa: regras, hosts normalizado
 timestamps, contadores, referências e hashes SHA-256. O conteúdo bruto e o caminho do JSONL
 manual não são persistidos. As saídas reduzidas e entradas seguras existem somente no diretório
 `runs/` do programa ativo; não há saída DNS, HTTP ou Naabu bruta em disco.
+O mapa da superfície não possui tabela própria: listagem e exportação são projeções das tabelas
+existentes.
 
 Não coloque API keys em código, arquivos JSON/JSONL ou SQLite. O orquestrador não lê, grava ou
 gerencia credenciais de provedores do subfinder.
@@ -499,5 +541,6 @@ ruff format .
   redirects, somente após o DNS mais recente estar `resolved`.
 - A verificação de portas usa somente Naabu em TCP CONNECT, nas quatro portas fixas, após HTTP
   `reachable` e sempre com `--confirm`.
+- O mapa da superfície apenas consolida estados locais já persistidos e não gera novo tráfego.
 - Sem ranges/full scan, UDP, SYN/raw socket, Nmap, crawler, ffuf, nuclei ou paths HTTP adicionais.
 - Sem processamento de requisições/respostas HTTP brutas ou segredos.

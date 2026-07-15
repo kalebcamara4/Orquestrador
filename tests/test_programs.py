@@ -158,6 +158,8 @@ def test_commands_fail_with_required_message_without_active_program(
         ["verify", "http", "1", "--dry-run"],
         ["verify", "ports", "1", "--dry-run"],
         ["ports", "list", "1"],
+        ["surface", "list", "1"],
+        ["surface", "export", "1"],
         ["policy", "show"],
         ["policy", "list"],
         ["policy", "set", "conservative"],

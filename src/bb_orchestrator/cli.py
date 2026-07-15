@@ -35,7 +35,9 @@ from bb_orchestrator.services import (
     MAX_TRIAGE_BATCH_SIZE,
     InputError,
     approve_candidates,
+    build_surface_map,
     export_assets,
+    export_surface_map,
     import_scope_file,
     ingest_jsonl,
     list_assets_with_dns,
@@ -66,6 +68,7 @@ verify_app = typer.Typer(help="Executa verificações ativas estritamente limita
 program_app = typer.Typer(help="Gerencia programas isolados.")
 policy_app = typer.Typer(help="Gerencia políticas tipadas do programa ativo.")
 ports_app = typer.Typer(help="Consulta portas abertas verificadas com segurança.")
+surface_app = typer.Typer(help="Consolida localmente DNS, HTTP e portas por host.")
 app.add_typer(scope_app, name="scope")
 app.add_typer(run_app, name="run")
 app.add_typer(queue_app, name="queue")
@@ -76,6 +79,7 @@ app.add_typer(verify_app, name="verify")
 app.add_typer(program_app, name="program")
 app.add_typer(policy_app, name="policy")
 app.add_typer(ports_app, name="ports")
+app.add_typer(surface_app, name="surface")
 
 InputFile = Annotated[
     Path,
@@ -575,6 +579,48 @@ def ports_list(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
     typer.echo("HOST  PORTA  STATUS")
     for port in ports:
         typer.echo(f"{port.host}  {port.port}  {port.status}")
+
+
+@surface_app.command("list")
+def surface_list(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
+    """Mostra a superfície consolidada sem subprocesso, arquivo ou rede."""
+    session, program = _program_session()
+    with session:
+        try:
+            records = build_surface_map(run_id, session, program_slug=program.slug)
+        except InputError as exc:
+            _abort(str(exc))
+    if not records:
+        typer.echo("Nenhum candidato nesta run.")
+        return
+    typer.echo("HOST  APROVAÇÃO  DNS  HTTP  STATUS  TÍTULO  TECNOLOGIAS  PORTAS  ESTÁGIO")
+    for record in records:
+        status_code = str(record.http_status_code) if record.http_status_code is not None else "-"
+        title = record.http_title or "-"
+        technologies = ",".join(record.http_technologies) or "-"
+        ports = ",".join(str(port) for port in record.open_ports) or "-"
+        typer.echo(
+            f"{record.host}  {record.approval_status.value}  {record.dns_status.value}  "
+            f"{record.http_reachability.value}  {status_code}  {title}  {technologies}  "
+            f"{ports}  {record.stage.value}"
+        )
+
+
+@surface_app.command("export")
+def surface_export(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
+    """Exporta somente a projeção local segura e determinística da run."""
+    session, program = _program_session()
+    with session:
+        try:
+            result = export_surface_map(
+                run_id,
+                session,
+                program_slug=program.slug,
+                runs_path=program.runs_path,
+            )
+        except InputError as exc:
+            _abort(str(exc))
+    typer.echo(f"Run {run_id}: superfície exportada={result.exported}; arquivo={result.path}.")
 
 
 @app.command("sanitize")

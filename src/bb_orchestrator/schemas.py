@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import (
     BaseModel,
@@ -54,6 +54,13 @@ class HttpReachability(StrEnum):
     PENDING = "pending"
     REACHABLE = "reachable"
     UNREACHABLE = "unreachable"
+
+
+class SurfaceStage(StrEnum):
+    PENDING = "pending"
+    DNS_RESOLVED = "dns_resolved"
+    HTTP_REACHABLE = "http_reachable"
+    PORTS_OBSERVED = "ports_observed"
 
 
 class Schema(BaseModel):
@@ -117,6 +124,42 @@ class IngestRecord(Schema):
     @classmethod
     def validate_domain(cls, value: str) -> str:
         return normalize_domain(value)
+
+
+SurfaceTechnology = Annotated[str, Field(min_length=1, max_length=80)]
+
+
+class SurfaceRecord(Schema):
+    """Projeção local e estrita dos estados seguros de um candidato."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, from_attributes=True)
+
+    host: str
+    approval_status: CandidateStatus
+    dns_status: DnsStatus
+    http_reachability: HttpReachability
+    http_status_code: int | None = Field(default=None, ge=100, le=599)
+    http_title: str | None = Field(default=None, max_length=200)
+    http_technologies: tuple[SurfaceTechnology, ...] = Field(
+        default_factory=tuple,
+        max_length=20,
+    )
+    open_ports: tuple[StrictInt, ...] = Field(default_factory=tuple)
+    stage: SurfaceStage
+
+    @field_validator("host")
+    @classmethod
+    def validate_surface_host(cls, value: str) -> str:
+        return normalize_domain(value)
+
+    @field_validator("open_ports")
+    @classmethod
+    def validate_open_ports(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if any(isinstance(port, bool) or not 1 <= port <= 65535 for port in value):
+            raise ValueError("porta inválida na superfície")
+        if value != tuple(sorted(set(value))):
+            raise ValueError("portas da superfície devem ser únicas e ordenadas")
+        return value
 
 
 class TriageSchema(BaseModel):

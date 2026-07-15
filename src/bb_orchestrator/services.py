@@ -56,6 +56,8 @@ from bb_orchestrator.schemas import (
     QueueStatus,
     RunStatus,
     ScopeRule,
+    SurfaceRecord,
+    SurfaceStage,
     TriageAsset,
     TriageBatch,
     TriageRequest,
@@ -228,6 +230,12 @@ class PortVerificationResult:
     open_ports: int
     input_path: Path
     output_path: Path
+
+
+@dataclass(frozen=True)
+class SurfaceExportResult:
+    exported: int
+    path: Path
 
 
 @dataclass(frozen=True)
@@ -1591,6 +1599,125 @@ def list_open_ports(run_id: int, session: Session) -> list[OpenPort]:
             .order_by(PortObservationModel.host, PortObservationModel.port)
         )
     ]
+
+
+def _surface_stage(
+    dns_status: str,
+    http_reachability: str,
+    open_ports: tuple[int, ...],
+) -> SurfaceStage:
+    if dns_status != DnsStatus.RESOLVED.value:
+        return SurfaceStage.PENDING
+    if http_reachability != HttpReachability.REACHABLE.value:
+        return SurfaceStage.DNS_RESOLVED
+    if open_ports:
+        return SurfaceStage.PORTS_OBSERVED
+    return SurfaceStage.HTTP_REACHABLE
+
+
+def build_surface_map(
+    run_id: int,
+    session: Session,
+    *,
+    program_slug: str,
+) -> list[SurfaceRecord]:
+    """Consolida somente dados locais, reduzidos e autorizados da run informada."""
+    _require_run(run_id, session)
+    candidates = list(
+        session.scalars(
+            select(CandidateModel)
+            .where(CandidateModel.run_id == run_id)
+            .order_by(CandidateModel.host, CandidateModel.id)
+        )
+    )
+    latest_dns = _latest_dns_attempts(run_id, session, program_slug=program_slug)
+    latest_http = _latest_http_attempts(run_id, session, program_slug=program_slug)
+    ports_by_host: dict[str, set[int]] = {}
+    candidate_hosts = {candidate.host for candidate in candidates}
+    for observation in session.scalars(
+        select(PortObservationModel)
+        .where(
+            PortObservationModel.run_id == run_id,
+            PortObservationModel.status == "open",
+        )
+        .order_by(PortObservationModel.host, PortObservationModel.port)
+    ):
+        if observation.host in candidate_hosts:
+            ports_by_host.setdefault(observation.host, set()).add(observation.port)
+
+    surface: list[SurfaceRecord] = []
+    for candidate in candidates:
+        dns_status = DnsStatus.PENDING.value
+        http_reachability = HttpReachability.PENDING.value
+        status_code: int | None = None
+        title: str | None = None
+        technologies: tuple[str, ...] = ()
+        open_ports: tuple[int, ...] = ()
+
+        if candidate.status == CandidateStatus.APPROVED.value:
+            dns_attempt = latest_dns.get(candidate.id)
+            if dns_attempt is not None:
+                dns_status = dns_attempt.status
+
+            if dns_status == DnsStatus.RESOLVED.value:
+                http_attempt = latest_http.get(candidate.id)
+                if http_attempt is not None:
+                    http_reachability = http_attempt.reachability
+
+                if http_reachability == HttpReachability.REACHABLE.value:
+                    observed_status_code = http_attempt.status_code
+                    if (
+                        not isinstance(observed_status_code, bool)
+                        and isinstance(observed_status_code, int)
+                        and 100 <= observed_status_code <= 599
+                    ):
+                        status_code = observed_status_code
+                    title = _sanitize_http_text(
+                        http_attempt.title,
+                        max_length=HTTP_TITLE_MAX_LENGTH,
+                    )
+                    sanitized_technologies = _sanitize_http_technologies(http_attempt.technologies)
+                    technologies = tuple(sanitized_technologies or ())
+                    open_ports = tuple(sorted(ports_by_host.get(candidate.host, set())))
+
+        surface.append(
+            SurfaceRecord(
+                host=candidate.host,
+                approval_status=candidate.status,
+                dns_status=dns_status,
+                http_reachability=http_reachability,
+                http_status_code=status_code,
+                http_title=title,
+                http_technologies=technologies,
+                open_ports=open_ports,
+                stage=_surface_stage(dns_status, http_reachability, open_ports),
+            )
+        )
+    return surface
+
+
+def export_surface_map(
+    run_id: int,
+    session: Session,
+    *,
+    program_slug: str,
+    runs_path: Path = DEFAULT_RUNS_PATH,
+) -> SurfaceExportResult:
+    """Exporta atomicamente a mesma projeção segura usada pela listagem local."""
+    records = build_surface_map(run_id, session, program_slug=program_slug)
+    content = "".join(
+        json.dumps(
+            record.model_dump(mode="json"),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+        for record in records
+    )
+    output_path = runs_path / str(run_id) / "surface" / "surface.jsonl"
+    _write_atomic(output_path, content, "surface.jsonl")
+    return SurfaceExportResult(exported=len(records), path=output_path)
 
 
 def list_assets_with_dns(
