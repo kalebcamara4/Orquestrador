@@ -232,6 +232,10 @@ class LlmTriageAttemptModel(Base):
             "status IN ('pending', 'validated', 'failed')",
             name="ck_llm_triage_attempt_status",
         ),
+        CheckConstraint(
+            "profile IN ('generic_ollama_json', 'gpt_oss_json')",
+            name="ck_llm_triage_attempt_profile",
+        ),
         Index("ix_llm_triage_attempt_run_batch", "run_id", "batch_id", "id"),
     )
 
@@ -244,6 +248,9 @@ class LlmTriageAttemptModel(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
     model_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    profile: Mapped[str] = mapped_column(String(32), nullable=False)
+    adapter_protocol_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(96), nullable=False)
     prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
     limits: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
@@ -264,6 +271,10 @@ class LlmTriageResultModel(Base):
         CheckConstraint(
             "confidence IN ('LOW', 'MEDIUM', 'HIGH')",
             name="ck_llm_triage_result_confidence",
+        ),
+        CheckConstraint(
+            "profile IN ('generic_ollama_json', 'gpt_oss_json')",
+            name="ck_llm_triage_result_profile",
         ),
         UniqueConstraint("run_id", "asset_id", name="uq_llm_triage_result_run_asset"),
         Index("ix_llm_triage_result_run_batch", "run_id", "batch_id", "asset_id"),
@@ -286,6 +297,119 @@ class LlmTriageResultModel(Base):
     manual_review_question: Mapped[str | None] = mapped_column(String(280), nullable=True)
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
     model_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    profile: Mapped[str] = mapped_column(String(32), nullable=False)
+    adapter_protocol_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(96), nullable=False)
     prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
     limits: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+
+
+class FlowMappingAttemptModel(Base):
+    __tablename__ = "flow_mapping_attempts"
+    __table_args__ = (
+        CheckConstraint("analysis_type = 'flow_mapping'", name="ck_flow_attempt_analysis_type"),
+        CheckConstraint("provider = 'ollama_local'", name="ck_flow_attempt_provider"),
+        CheckConstraint(
+            "profile IN ('generic_ollama_json', 'gpt_oss_json')",
+            name="ck_flow_attempt_profile",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'validated', 'failed')",
+            name="ck_flow_attempt_status",
+        ),
+        Index("ix_flow_attempt_run_batch", "run_id", "batch_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    program_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("programs.slug"), nullable=False, index=True
+    )
+    run_id: Mapped[int] = mapped_column(ForeignKey("runs.id"), nullable=False, index=True)
+    batch_id: Mapped[str] = mapped_column(String(4), nullable=False)
+    analysis_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    mapping_policy: Mapped[str] = mapped_column(String(32), nullable=False)
+    output_policy: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    model_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    profile: Mapped[str] = mapped_column(String(32), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    adapter_protocol_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(48), nullable=False)
+    schema_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+
+class FlowMappingResultModel(Base):
+    __tablename__ = "flow_mapping_results"
+    __table_args__ = (
+        CheckConstraint("analysis_type = 'flow_mapping'", name="ck_flow_result_analysis_type"),
+        CheckConstraint("provider = 'ollama_local'", name="ck_flow_result_provider"),
+        CheckConstraint(
+            "profile IN ('generic_ollama_json', 'gpt_oss_json')",
+            name="ck_flow_result_profile",
+        ),
+        UniqueConstraint(
+            "program_id", "run_id", "asset_id", name="uq_flow_result_program_run_asset"
+        ),
+        Index("ix_flow_result_run_batch", "run_id", "batch_id", "asset_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    attempt_id: Mapped[int] = mapped_column(
+        ForeignKey("flow_mapping_attempts.id"), nullable=False, index=True
+    )
+    program_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("programs.slug"), nullable=False, index=True
+    )
+    run_id: Mapped[int] = mapped_column(ForeignKey("runs.id"), nullable=False, index=True)
+    batch_id: Mapped[str] = mapped_column(String(4), nullable=False)
+    asset_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    analysis_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    mapping_policy: Mapped[str] = mapped_column(String(32), nullable=False)
+    output_policy: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    model_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    profile: Mapped[str] = mapped_column(String(32), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    adapter_protocol_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(48), nullable=False)
+    schema_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    flow_mappings: Mapped[list[dict[str, object]]] = mapped_column(JSON, nullable=False)
+    context_gaps: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    review_questions: Mapped[list[dict[str, object]]] = mapped_column(JSON, nullable=False)
+    analyzed_at: Mapped[datetime] = mapped_column(nullable=False)
+
+
+class OllamaCompatibilityVerificationModel(Base):
+    __tablename__ = "ollama_compatibility_verifications"
+    __table_args__ = (
+        CheckConstraint(
+            "provider = 'ollama_local'",
+            name="ck_ollama_compatibility_provider",
+        ),
+        CheckConstraint(
+            "profile IN ('generic_ollama_json', 'gpt_oss_json')",
+            name="ck_ollama_compatibility_profile",
+        ),
+        CheckConstraint(
+            "status IN ('validated', 'failed')",
+            name="ck_ollama_compatibility_status",
+        ),
+        Index("ix_ollama_compatibility_latest", "program_slug", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    program_slug: Mapped[str] = mapped_column(
+        String(64), ForeignKey("programs.slug"), nullable=False, index=True
+    )
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    model_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    profile: Mapped[str] = mapped_column(String(32), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    adapter_protocol_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(96), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    verified_at: Mapped[datetime] = mapped_column(nullable=False)

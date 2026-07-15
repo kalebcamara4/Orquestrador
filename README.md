@@ -5,8 +5,8 @@ O fluxo começa com descoberta passiva e aprovação humana obrigatória. Depois
 ele permite três verificações ativas mínimas: resolução DNS com `dnsx`, consulta HTTP raiz com
 `httpx` e quatro portas TCP fixas com `naabu`. Depois do mapa local, o Katana pode descobrir paths
 públicos com profundidade 1, sem autenticação, JavaScript ou headless. Não há fuzzing, nuclei ou
-agentes autônomos. Opcionalmente, uma LLM já instalada no Ollama local pode classificar somente os
-lotes sanitizados, sem ferramentas ou acesso aos alvos.
+agentes autônomos. Opcionalmente, uma LLM já instalada no Ollama local pode organizar lacunas de
+contexto e perguntas defensivas sobre lotes sanitizados, sem ferramentas ou acesso aos alvos.
 Depois dessas verificações, um mapa local consolida os estados já persistidos sem gerar tráfego
 adicional.
 
@@ -106,7 +106,7 @@ scope import → recon passivo → candidatos em escopo → aprovação humana
              → descoberta pública de paths → mapa local atualizado
              → assets list/export
              → sanitize → fila → triage --dry-run
-             → classificação local opcional → revisão humana
+             → mapeamento local de fluxos → perguntas opcionais da LLM → revisão humana
 ```
 
 ### Política de execução do programa
@@ -482,167 +482,132 @@ referências na fila. A operação é idempotente e a fila não contém payload 
 bb queue list
 ```
 
-### 7. Prepare a triagem de superfície sanitizada em modo local
+### 7. Gere o mapeamento determinístico de fluxos
 
-Somente itens pendentes associados a assets sanitizados e a candidatos aprovados entram nos lotes:
+Esta fase mapeia **pistas de fluxos de produto**, não vulnerabilidades, severidade ou prioridade.
+Um nome conhecido é somente um sinal lexical inicial. Ele não prova tipo real de dado, vínculo com
+usuário, presença ou ausência de controle, impacto ou regra violada. A regra central é:
+
+> Contexto não observado nunca significa controle ausente.
+
+Gere os lotes localmente, sem rede, subprocesso ou chamada à LLM:
 
 ```bash
-bb triage 1 --dry-run
+bb triage 3 --dry-run
+bb triage 3 --dry-run --batch-size 20
 ```
 
-O tamanho padrão é 10. É possível escolher entre 1 e 20 itens por lote:
+Os novos arquivos são
+`.bb/programs/<slug>/runs/<run-id>/llm/flow-map-input-<batch-id>.json`. Lotes antigos
+`triage-input-*.json`, snapshots, resultados antigos, `route-priority-v1` e a política de execução
+`conservative` não são alterados. Reexecutar o comando substitui somente `flow-map-input-*` da
+mesma run, de forma determinística.
 
-```bash
-bb triage 1 --dry-run --batch-size 20
-```
+O Python aplica `flow-signal-policy-v1` antes da LLM e ordena a taxonomia:
+`IDENTITY_ACCESS`, `USER_DATA_RESOURCE`, `TRANSACTION_ORDER`, `MONEY_VALUE`,
+`BENEFIT_ENTITLEMENT`, `STATE_WORKFLOW`, `ADMIN_PRIVILEGED`, `INTEGRATION_API`,
+`CONTENT_PUBLIC` e `UNKNOWN_DYNAMIC`. A correspondência usa segmentos completos em lowercase;
+por isso `/accounting` não corresponde a `account`. Hífens só correspondem quando o alias composto
+está explicitamente na política.
 
-Os arquivos são gravados em
-`.bb/programs/<slug>/runs/<run-id>/llm/triage-input-<batch-id>.json`. Por exemplo:
+Paths estáticos, JavaScript e CSS nunca são evidência de fluxo. Status HTTP, título, Cloudflare ou
+outra tecnologia também não entram no novo lote. Cada sinal guarda até cinco paths lexicográficos
+e mantém o total em `evidence_paths_total`. Um path dinâmico sem correspondência — inclusive
+`/workspace` ou `/x7/portal` — é preservado em `unknown_dynamic_paths`; nome incomum nunca equivale
+a descarte.
 
-```text
-.bb/programs/acme/runs/1/llm/triage-input-0001.json
-.bb/programs/acme/runs/1/llm/triage-input-0002.json
-```
-
-`run-id` e `batch-id` são identificadores diferentes:
-
-- Em `bb triage 1 --dry-run`, o `1` é o ID persistente da run no SQLite.
-- `0001` significa “primeiro lote desta run”; a numeração começa novamente em cada run.
-- Com o tamanho padrão, uma run com 1 a 10 itens gera apenas `triage-input-0001.json`; com 11 a
-  20 itens, gera `0001` e `0002`.
-- Assim, as runs 1 e 2 podem ter, cada uma, seu próprio arquivo `triage-input-0001.json`, em
-  diretórios diferentes dentro de `.bb/programs/<slug>/runs/`.
-
-Executar novamente a triagem da mesma run recria os mesmos lotes deterministicamente e substitui
-os arquivos `triage-input-*.json` daquele diretório. Nesta etapa, triage não consome a fila e não
-altera candidatos, verificações HTTP, paths, assets, queue items ou snapshots: ela apenas prepara
-arquivos locais para futura análise humana ou por LLM.
-
-A fonte de verdade é exclusivamente o SQLite do programa ativo. Para cada asset elegível, a
-preparação usa o último status HTTP, título e tecnologias já sanitizados e os registros da tabela
-`crawl_paths` da mesma run e host. O arquivo `crawl/paths.jsonl` nunca é lido pela triagem; ele
-continua sendo somente um artefato de exportação.
-
-Cada arquivo declara no envelope a política local versionada `route-priority-v1`. Ela é uma
-política de seleção de contexto, independente da política de execução `conservative`; não cria nem
-altera snapshots de execução. Cada item possui um `asset_id` derivado deterministicamente do host
-canônico e contém somente a allowlist abaixo:
+Aliases confirmados manualmente podem ser colocados somente em
+`.bb/programs/<slug>/flow-aliases-v1.json`. Cada entrada registra o mesmo `program_id`, origem
+`manual`, versão e timestamp com timezone, e associa um segmento ou path a uma categoria geral:
 
 ```json
 {
-  "batch_id": "0001",
-  "selection_policy": "route-priority-v1",
-  "items": [
+  "policy": "flow-aliases-v1",
+  "program_id": "acme",
+  "aliases": [
     {
-      "asset_id": "asset-<sha256>",
-      "host": "api.example.com",
-      "status": 200,
-      "title": "Safe Title",
-      "technologies": ["nginx", "React"],
-      "paths": ["/", "/api/v1/users", "/login"],
-      "paths_total": 3,
-      "paths_included": 3,
-      "paths_omitted_by_policy": 0,
-      "paths_omitted_by_limit": 0
+      "program_id": "acme",
+      "origin": "manual",
+      "version": "1",
+      "timestamp": "2026-07-15T12:00:00-03:00",
+      "match_type": "segment",
+      "value": "workspace",
+      "flow_type": "USER_DATA_RESOURCE"
     }
   ]
 }
 ```
 
-`route-priority-v1` deduplica os paths antes de classificá-los e desempata cada categoria pelo path
-normalizado em ordem lexicográfica. A ordem é: raiz `/`; rotas com segmentos explícitos de
-aplicação, identidade ou API; documentação de API e arquivos dinâmicos reconhecidos; paths sem
-extensão final; e até cinco referências JavaScript próprias do host. CSS, imagens, fontes,
-manifestos, source maps, arquivos compactados, bibliotecas e minificados evidentes não entram no
-lote. Paths estáticos nunca são usados apenas para completar 50 itens, e nenhum JavaScript é
-baixado ou interpretado nesta etapa.
+O arquivo é estrito e isolado pelo diretório e `program_id`: aliases não vazam entre programas.
+A LLM nunca cria ou persiste aliases. Uma inferência da LLM sobre path desconhecido permanece
+explicitamente `TENTATIVE_PATH_SEMANTIC_INFERENCE`, exige `OTHER_CONTEXT_NOT_OBSERVED` e continua
+dependendo de revisão humana.
 
-Cada asset inclui no máximo 50 paths. `paths_total` informa o total sanitizado e deduplicado no
-SQLite; `paths_included` informa quantos foram enviados; `paths_omitted_by_policy` conta paths
-estáticos ou irrelevantes; e `paths_omitted_by_limit` conta os elegíveis que excederam 50. A CLI
-exibe os totais dessas três últimas contagens. Assets sem crawl mantêm os quatro contadores em zero
-e `paths: []`. Todos os registros continuam preservados em `crawl_paths` e em `paths.jsonl`.
+### 8. Organize lacunas com uma LLM local, sem ferramentas
 
-O JSON final passa por um policy gate default-deny antes da gravação. Campos extras, URLs, query
-strings, fragmentos, hosts, IPs, portas, credenciais, headers, corpo HTTP, cookies, tokens, chaves,
-e-mails, telefones, controles e PII fazem a preparação inteira falhar antes de qualquer lote ser
-gravado. Uma run inexistente ou sem itens sanitizados e pendentes também falha sem criar lotes.
+A LLM recebe exclusivamente `flow-map-input-*.json`. Ela não pode alterar ou omitir sinais
+determinísticos; apenas organiza lacunas permitidas, mantém cada path desconhecido ou sugere uma
+categoria tentativa e formula até três perguntas defensivas em português brasileiro. Ela não lê
+os lotes legados, SQLite de superfície, status, títulos, tecnologias, respostas HTTP, headers,
+cookies, tokens, IPs, portas ou conteúdo JavaScript.
 
-A seleção serve somente para reduzir contexto. As categorias não representam severidade, não
-afirmam vulnerabilidade, não confirmam autorização ou acesso a conteúdo e não constituem PoC.
-
-### 8. Classifique os lotes com uma LLM local, sem ferramentas
-
-A integração de LLM é um **analista local limitado**, não um agente autônomo. Ela lê exclusivamente
-os arquivos `triage-input-*.json` já criados pelo comando anterior e envia um lote por vez ao
-endpoint fixo `http://127.0.0.1:11434/api/chat`. Ela não lê SQLite de superfície, responses HTTP,
-headers, cookies, IPs, portas, artefatos brutos ou qualquer outro arquivo para montar o contexto.
-Também não recebe ferramentas e não pode fazer requisições contra alvos, executar comandos, gerar
-PoC ou confirmar vulnerabilidades.
-
-O orquestrador não inicia o Ollama, não baixa modelos, não executa `ollama pull` e não altera a
-configuração do serviço. Instale e disponibilize o modelo separadamente; depois persista somente o
-ID local para o programa ativo:
+Configure um modelo já instalado. O endpoint continua fixo em
+`http://127.0.0.1:11434/api/chat`; não há provedor remoto, ferramentas ou tool-calling:
 
 ```bash
 bb llm ollama configure --model qwen2.5:7b
+bb llm ollama configure --model gpt-oss:20b --profile gpt_oss_json
+bb llm ollama profiles
 bb llm status
 ```
 
-O arquivo `.bb/programs/<slug>/llm-config.json` contém apenas `provider=ollama_local` e `model_id`.
-Não há URL, hostname, porta, proxy ou API key configurável. `bb llm status` apenas mostra esse
-arquivo local; ele não testa disponibilidade nem chama a LLM. IDs marcados como modelos `cloud`
-são recusados para impedir encaminhamento indireto a um provedor remoto.
+`generic_ollama_json` omite `think`; `gpt_oss_json` envia somente `think: "low"`. Ambos usam
+`stream: false`, temperatura zero e structured output. O schema de `FlowMappingResponse` é a fonte
+única usada pelo Pydantic, pelo campo Ollama `format`, pela cópia compacta no prompt e pelo
+fingerprint persistido.
 
-Antes de qualquer conexão, inspecione o plano. O dry-run mostra lotes, itens, modelo e a versão do
-prompt, mas não abre conexão:
-
-```bash
-bb llm triage 1 --dry-run
-```
-
-A chamada exige confirmação explícita:
+Como schema e protocolo mudaram, uma verificação anterior fica `stale`. Revalide com o JSON
+inofensivo `{"ok": true}`; essa chamada nunca recebe hosts, paths, fluxos ou dados de programa:
 
 ```bash
-bb llm triage 1 --confirm
-bb llm results 1
+bb llm ollama verify --confirm
 ```
 
-Cada lote é processado serialmente, sem retry, com timeout fixo de 90 segundos, `stream: false`,
-temperatura zero e output estruturado por schema JSON. Proxies do ambiente e redirects HTTP são
-bloqueados. Indisponibilidade do serviço ou do modelo produz erro sanitizado; o corpo bruto da
-resposta do Ollama, conteúdo inválido e raciocínio interno nunca são persistidos.
+Inspecione o plano sem abrir conexão e depois confirme explicitamente:
 
-O schema estrito de resposta é:
-
-```json
-{
-  "items": [
-    {
-      "asset_id": "asset-<sha256>",
-      "decision": "IGNORE|LOW_PRIORITY|NEEDS_REVIEW",
-      "confidence": "LOW|MEDIUM|HIGH",
-      "evidence": [
-        {"kind": "PATH|HTTP_STATUS|TECHNOLOGY", "value": "valor exato do lote"}
-      ],
-      "missing_context": [
-        "AUTHORIZATION|USER_ROLE|RESPONSE_BEHAVIOR|BUSINESS_RULE|OTHER"
-      ],
-      "manual_review_question": "Pergunta defensiva curta ou null"
-    }
-  ]
-}
+```bash
+bb llm triage 3 --dry-run
+bb llm triage 3 --confirm
+bb llm results 3
 ```
 
-Cada asset do lote deve aparecer exatamente uma vez. IDs extras, campos inesperados, JSON com
-texto adicional, enums inválidas, evidências inventadas e perguntas inseguras fazem o lote falhar
-fechado. Os resultados só são substituídos após todos os lotes da execução serem validados. O
-artefato determinístico contém apenas dados validados em
-`.bb/programs/<slug>/runs/<run-id>/llm/results/triage-results.json`.
+Em sequência, o fluxo da etapa é:
 
-`bb llm results` mostra somente `HOST`, `DECISÃO`, `CONFIANÇA` e `PERGUNTA`. A decisão
-`NEEDS_REVIEW` é apenas uma hipótese de priorização para validação humana; não é um achado, não
-confirma vulnerabilidade e não substitui autorização ou revisão manual.
+```bash
+bb triage 3 --dry-run
+bb llm ollama verify --confirm
+bb llm triage 3 --dry-run
+bb llm triage 3 --confirm
+bb llm results 3
+```
+
+O dry-run mostra programa, modelo, profile, prompt, políticas, lotes, assets, sinais
+determinísticos, paths desconhecidos e fluxos que exigem contexto. A confirmação processa lotes
+serialmente, uma vez cada, sem retry e com timeout de 90 segundos. O Ollama fornece somente
+`message.content`; `message.thinking` é descartado integralmente.
+
+`flow-output-policy-v1` falha fechado se houver asset, path, enum, fluxo ou alias inventado; sinal
+determinístico ou path desconhecido ausente/duplicado; lacuna mínima omitida; pergunta sem fluxo ou
+lacuna correspondente; asset `CONTEXT_REQUIRED` sem pergunta; campo extra; Markdown; texto fora do
+JSON; URL, query, fragmento, IP, porta, credencial, header, cookie ou PII; ou pergunta que antecipe
+vulnerabilidade, IDOR, bypass, exploit, controle ausente ou regra violada. Nada é completado ou
+reinterpretado silenciosamente.
+
+Somente a resposta integralmente validada é gravada em novas tabelas e em
+`.bb/programs/<slug>/runs/<run-id>/llm/results/flow-mapping-results.json`. Resposta bruta,
+chain-of-thought, `message.thinking` e conteúdo inválido nunca são persistidos. A listagem nova usa
+`HOST | FLUXOS | LACUNAS | PERGUNTAS`. Se houver somente resultados antigos, ela os identifica
+como `legacy_triage` e não mistura formatos. A revisão humana continua obrigatória.
 
 ## Bancos locais isolados
 
@@ -652,8 +617,9 @@ programas. O arquivo `.bb/current-program.json` contém somente o slug atualment
 
 As tabelas incluem `programs`, `program_policies`, `execution_policy_snapshots`, `scope_rules`,
 `runs`, `candidates`, `dns_verification_attempts`, `http_verification_attempts`,
-`port_observations`, `crawl_paths`, `assets`, `queue_items`, `llm_triage_attempts` e
-`llm_triage_results`. Cada banco
+`port_observations`, `crawl_paths`, `assets`, `queue_items`, `llm_triage_attempts`,
+`llm_triage_results`, `flow_mapping_attempts`, `flow_mapping_results` e
+`ollama_compatibility_verifications`. Cada banco
 armazena apenas os metadados e dados daquele programa: regras, hosts normalizados, fonte, estados,
 timestamps, contadores, referências e hashes SHA-256. O conteúdo bruto e o caminho do JSONL
 manual não são persistidos. As saídas reduzidas e entradas seguras existem somente no diretório
@@ -685,8 +651,9 @@ ruff format .
 
 - A única LLM suportada é um modelo já instalado no Ollama local, acessado no endpoint fixo de
   loopback. Sem LiteLLM, LM Studio, DeepSeek ou provedores remotos.
-- A LLM somente classifica prioridade e formula perguntas defensivas sobre lotes sanitizados; sem
-  ferramentas, ações contra alvos, comandos, PoC ou confirmação de vulnerabilidade.
+- A LLM somente organiza contexto não observado e formula perguntas defensivas sobre lotes
+  sanitizados; não classifica vulnerabilidade ou prioridade e não possui ferramentas, ações contra
+  alvos, comandos, PoC ou capacidade de confirmação.
 - Sem GUI, servidor web ou Docker.
 - A descoberta de hosts é somente o subfinder passivo, após `--confirm`.
 - A verificação DNS usa somente dnsx, com 5 threads e 5 DNS/s, após aprovação humana.

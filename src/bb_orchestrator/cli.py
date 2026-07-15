@@ -15,13 +15,20 @@ from bb_orchestrator.database import (
     initialize_database,
 )
 from bb_orchestrator.llm import (
-    PROMPT_VERSION,
+    ADAPTER_PROTOCOL_VERSION,
+    COMPATIBILITY_PROMPT_VERSION,
+    FLOW_PROMPT_VERSION,
+    OLLAMA_PROFILES,
     LlmError,
+    OllamaProfileName,
     configure_ollama,
-    inspect_llm_triage,
-    list_llm_results,
+    inspect_flow_mapping,
+    inspect_ollama_verification,
+    llm_results_view,
     load_ollama_config,
-    run_llm_triage,
+    ollama_compatibility_state,
+    run_flow_mapping,
+    verify_ollama_compatibility,
 )
 from bb_orchestrator.policies import (
     PolicyError,
@@ -60,7 +67,7 @@ from bb_orchestrator.services import (
     plan_http_verification,
     plan_katana_crawl,
     plan_port_verification,
-    prepare_triage,
+    prepare_flow_mapping,
     reject_candidates,
     run_passive_recon,
     sanitize_run,
@@ -83,7 +90,7 @@ ports_app = typer.Typer(help="Consulta portas abertas verificadas com segurança
 surface_app = typer.Typer(help="Consolida localmente DNS, HTTP e portas por host.")
 crawl_app = typer.Typer(help="Executa descoberta pública estritamente limitada.")
 paths_app = typer.Typer(help="Consulta caminhos públicos sanitizados.")
-llm_app = typer.Typer(help="Classifica lotes sanitizados com uma LLM estritamente local.")
+llm_app = typer.Typer(help="Organiza lacunas de contexto com uma LLM estritamente local.")
 ollama_app = typer.Typer(help="Configura somente o provedor Ollama local fixo.")
 app.add_typer(scope_app, name="scope")
 app.add_typer(run_app, name="run")
@@ -136,20 +143,38 @@ def llm_ollama_configure(
         str,
         typer.Option("--model", help="ID local seguro de um modelo já instalado no Ollama."),
     ],
+    profile: Annotated[
+        OllamaProfileName,
+        typer.Option("--profile", help="Perfil técnico fixo de compatibilidade Ollama."),
+    ] = OllamaProfileName.GENERIC_OLLAMA_JSON,
 ) -> None:
-    """Persiste apenas provider e model_id; não consulta nem modifica o Ollama."""
+    """Persiste provider, model_id e profile; não consulta nem modifica o Ollama."""
     try:
         program = require_active_program()
     except ProgramError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
     try:
-        config = configure_ollama(program.database_path.parent, model_id)
+        config = configure_ollama(program.database_path.parent, model_id, profile)
     except LlmError as exc:
         _abort(str(exc))
     typer.echo(f"Program: {program.slug}")
     typer.echo(f"Provider: {config.provider}")
     typer.echo(f"Model: {config.model_id}")
+    typer.echo(f"Profile: {config.profile}")
+
+
+@ollama_app.command("profiles")
+def llm_ollama_profiles() -> None:
+    """Lista somente os perfis técnicos fixos implementados."""
+    typer.echo("PROFILE  STRUCTURED_OUTPUT  THINK  STREAM  TEMPERATURE")
+    for profile in OLLAMA_PROFILES.values():
+        think = profile.think if profile.think is not None else "omitted"
+        structured = "required" if profile.structured_output_required else "optional"
+        typer.echo(
+            f"{profile.name.value}  {structured}  {think}  "
+            f"{str(profile.stream).lower()}  {profile.temperature}"
+        )
 
 
 @llm_app.command("status")
@@ -164,9 +189,69 @@ def llm_status() -> None:
         config = load_ollama_config(program.database_path.parent)
     except LlmError as exc:
         _abort(str(exc))
+    session, _ = _program_session(announce=False)
+    with session:
+        state = ollama_compatibility_state(
+            session,
+            program_slug=program.slug,
+            config=config,
+        )
     typer.echo(f"Program: {program.slug}")
     typer.echo(f"Provider: {config.provider}")
     typer.echo(f"Model: {config.model_id}")
+    typer.echo(f"Profile: {config.profile}")
+    typer.echo(f"Compatibility: {state.state}")
+    typer.echo(f"Last verification: {state.verified_at.isoformat() if state.verified_at else '-'}")
+
+
+@ollama_app.command("verify")
+def llm_ollama_verify(
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Mostra a verificação local sem abrir conexão."),
+    ] = False,
+    confirm: Annotated[
+        bool,
+        typer.Option("--confirm", help="Confirma a verificação inofensiva no Ollama local."),
+    ] = False,
+) -> None:
+    """Verifica structured output sem enviar qualquer dado de programa ou run."""
+    if dry_run == confirm:
+        _abort("escolha exatamente uma opção: --dry-run ou --confirm")
+    try:
+        program = require_active_program()
+    except ProgramError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Program: {program.slug}")
+    if dry_run:
+        try:
+            plan = inspect_ollama_verification(program.database_path.parent)
+        except LlmError as exc:
+            _abort(str(exc))
+        typer.echo(f"Provider: {plan.config.provider}")
+        typer.echo(f"Model: {plan.config.model_id}")
+        typer.echo(f"Profile: {plan.config.profile}")
+        typer.echo(f"Prompt: {plan.prompt_version}")
+        typer.echo(f"Adapter: {plan.adapter_protocol_version}")
+        typer.echo(f"Schema: {plan.schema_version}")
+        typer.echo("Verificação local: sem conexão.")
+        return
+
+    session, _ = _program_session(announce=False)
+    with session:
+        try:
+            result = verify_ollama_compatibility(
+                session,
+                program_slug=program.slug,
+                program_directory=program.database_path.parent,
+            )
+        except LlmError as exc:
+            _abort(str(exc))
+    typer.echo(
+        f"Compatibilidade: {result.status}; "
+        f"adapter={ADAPTER_PROTOCOL_VERSION}; prompt={COMPATIBILITY_PROMPT_VERSION}."
+    )
 
 
 @llm_app.command("triage")
@@ -181,7 +266,7 @@ def llm_triage(
         typer.Option("--confirm", help="Confirma o POST fixo para o Ollama local."),
     ] = False,
 ) -> None:
-    """Classifica exclusivamente lotes previamente preparados por bb triage --dry-run."""
+    """Mapeia contexto exclusivamente a partir de lotes flow-map-input v1."""
     if dry_run == confirm:
         _abort("escolha exatamente uma opção: --dry-run ou --confirm")
     try:
@@ -193,8 +278,9 @@ def llm_triage(
 
     if dry_run:
         try:
-            plan = inspect_llm_triage(
+            plan = inspect_flow_mapping(
                 run_id,
+                program_id=program.slug,
                 program_directory=program.database_path.parent,
                 runs_path=program.runs_path,
             )
@@ -202,18 +288,27 @@ def llm_triage(
             _abort(str(exc))
         typer.echo(f"Provider: {plan.config.provider}")
         typer.echo(f"Model: {plan.config.model_id}")
-        typer.echo(f"Prompt: {PROMPT_VERSION}")
+        typer.echo(f"Profile: {plan.config.profile}")
+        typer.echo(f"Prompt: {FLOW_PROMPT_VERSION}")
+        typer.echo(f"Mapping policy: {plan.mapping_policy}")
+        typer.echo(f"Output policy: {plan.output_policy}")
+        typer.echo(f"Selection policy: {plan.selection_policy}")
         typer.echo(f"Lotes: {', '.join(plan.batch_ids)}")
-        typer.echo(f"Run {run_id}: lotes={plan.batch_count}; itens={plan.item_count}; sem conexão.")
+        typer.echo(
+            f"Run {run_id}: lotes={plan.batch_count}; assets={plan.item_count}; "
+            f"sinais determinísticos={plan.deterministic_signal_count}; "
+            f"paths desconhecidos={plan.unknown_dynamic_path_count}; "
+            f"fluxos CONTEXT_REQUIRED={plan.context_required_flow_count}; sem conexão."
+        )
         return
 
     session, _ = _program_session(announce=False)
     with session:
         try:
-            result = run_llm_triage(
+            result = run_flow_mapping(
                 run_id,
                 session,
-                program_slug=program.slug,
+                program_id=program.slug,
                 program_directory=program.database_path.parent,
                 runs_path=program.runs_path,
             )
@@ -227,20 +322,43 @@ def llm_triage(
 
 @llm_app.command("results")
 def llm_results(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
-    """Exibe somente host, decisão, confiança e pergunta já validados."""
+    """Exibe flow_mapping validado ou identifica resultados antigos sem misturá-los."""
     session, program = _program_session(announce=False)
     with session:
         try:
-            results = list_llm_results(run_id, session, runs_path=program.runs_path)
+            view = llm_results_view(
+                run_id,
+                session,
+                program_id=program.slug,
+                program_directory=program.database_path.parent,
+                runs_path=program.runs_path,
+            )
         except LlmError as exc:
             _abort(str(exc))
-    if not results:
-        typer.echo("Nenhum resultado validado.")
+    if view.analysis_type == "none":
+        input_directory = program.runs_path / str(run_id) / "llm"
+        if (
+            not input_directory.is_symlink()
+            and input_directory.is_dir()
+            and any(input_directory.glob("flow-map-input-*.json"))
+        ):
+            typer.echo("Nenhum resultado flow_mapping validado.")
+        else:
+            typer.echo(f"Execute bb triage {run_id} --dry-run para gerar flow-map-input v1.")
         return
-    typer.echo("HOST  DECISÃO  CONFIANÇA  PERGUNTA")
-    for result in results:
-        question = result.manual_review_question or "-"
-        typer.echo(f"{result.host}  {result.decision}  {result.confidence}  {question}")
+    if view.analysis_type == "legacy_triage":
+        typer.echo("Analysis: legacy_triage")
+        typer.echo("HOST  DECISÃO  CONFIANÇA  PERGUNTA")
+        for result in view.legacy_triage:
+            question = result.manual_review_question or "-"
+            typer.echo(f"{result.host}  {result.decision}  {result.confidence}  {question}")
+        return
+    typer.echo("HOST | FLUXOS | LACUNAS | PERGUNTAS")
+    for result in view.flow_mapping:
+        flows = ", ".join(result.flows) or "-"
+        gaps = ", ".join(result.context_gaps) or "-"
+        questions = " / ".join(result.questions) or "-"
+        typer.echo(f"{result.host} | {flows} | {gaps} | {questions}")
 
 
 @program_app.command("create")
@@ -882,25 +1000,28 @@ def triage(
         ),
     ] = DEFAULT_TRIAGE_BATCH_SIZE,
 ) -> None:
-    """Prepara lotes locais de superfície para futura análise humana ou por LLM."""
+    """Prepara lotes locais v1 de sinais de fluxo sem rede, LLM ou subprocessos."""
     if not dry_run:
         _abort("triage está disponível somente com --dry-run nesta etapa")
 
     session, program = _program_session()
     with session:
         try:
-            result = prepare_triage(
+            result = prepare_flow_mapping(
                 run_id,
                 session,
+                program_id=program.slug,
+                program_directory=program.database_path.parent,
                 batch_size=batch_size,
                 runs_path=program.runs_path,
             )
         except InputError as exc:
             _abort(str(exc))
     typer.echo(
-        f"Run {run_id}: assets={result.item_count}, paths incluídos={result.paths_included}, "
-        f"paths omitidos por política={result.paths_omitted_by_policy}, "
-        f"paths omitidos por limite={result.paths_omitted_by_limit}, "
+        f"Run {run_id}: assets={result.item_count}, "
+        f"sinais determinísticos={result.deterministic_signal_count}, "
+        f"paths desconhecidos={result.unknown_dynamic_path_count}, "
+        f"fluxos CONTEXT_REQUIRED={result.context_required_flow_count}, "
         f"lotes={result.batch_count}; "
         f"arquivos em {program.runs_path}/{run_id}/llm/."
     )

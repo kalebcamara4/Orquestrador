@@ -18,6 +18,13 @@ from pydantic import (
 )
 
 from bb_orchestrator.domain import ScopeKind, normalize_domain, parse_scope_pattern
+from bb_orchestrator.flow_policies import (
+    ContextGap,
+    DeterministicFlowBasis,
+    FlowOutputBasis,
+    FlowRelevance,
+    FlowType,
+)
 from bb_orchestrator.triage_selection import (
     MAX_SELECTED_PATHS,
     RouteSelectionPolicyName,
@@ -274,3 +281,140 @@ class TriageDecision(TriageSchema):
 
 class TriageResponse(TriageSchema):
     items: list[TriageDecision]
+
+
+class FlowSchema(BaseModel):
+    """Schema fechado da nova fronteira de mapeamento de fluxos."""
+
+    # Enums vindas de JSON precisam ser materializadas como ``StrEnum``; os escalares que não
+    # podem sofrer coerção usam explicitamente StrictStr/StrictInt.
+    model_config = ConfigDict(extra="forbid")
+
+
+FlowPath = Annotated[StrictStr, Field(min_length=1, max_length=512)]
+
+
+def _validate_flow_paths(value: list[str]) -> list[str]:
+    if len(value) != len(set(value)) or value != sorted(value):
+        raise ValueError("paths de fluxo devem ser únicos e ordenados")
+    for path in value:
+        if not path.startswith("/") or path.startswith("//"):
+            raise ValueError("path relativo de fluxo inválido")
+        if "?" in path or "#" in path or "\\" in path:
+            raise ValueError("query string, fragmento ou separador inválido")
+        if any(unicodedata.category(character).startswith("C") for character in path):
+            raise ValueError("caractere de controle não permitido")
+    return value
+
+
+class DeterministicFlowSignal(FlowSchema):
+    flow_type: FlowType
+    basis: DeterministicFlowBasis
+    relevance: FlowRelevance
+    evidence_paths: list[FlowPath] = Field(min_length=1, max_length=5)
+    evidence_paths_total: StrictInt = Field(ge=1)
+    required_context: list[ContextGap] = Field(max_length=len(ContextGap))
+
+    @field_validator("evidence_paths")
+    @classmethod
+    def validate_evidence_paths(cls, value: list[str]) -> list[str]:
+        return _validate_flow_paths(value)
+
+    @field_validator("required_context")
+    @classmethod
+    def validate_required_context(cls, value: list[ContextGap]) -> list[ContextGap]:
+        if len(value) != len(set(value)):
+            raise ValueError("lacuna determinística duplicada")
+        return value
+
+    @model_validator(mode="after")
+    def validate_evidence_total(self) -> DeterministicFlowSignal:
+        if self.evidence_paths_total < len(self.evidence_paths):
+            raise ValueError("evidence_paths_total menor que as evidências incluídas")
+        return self
+
+
+class FlowMappingAsset(FlowSchema):
+    asset_id: StrictStr = Field(pattern=r"^asset-[0-9a-f]{64}$")
+    host: StrictStr = Field(min_length=1, max_length=253)
+    deterministic_flow_signals: list[DeterministicFlowSignal] = Field(max_length=20)
+    unknown_dynamic_paths: list[FlowPath] = Field(max_length=100)
+    unknown_dynamic_paths_total: StrictInt = Field(ge=0, le=100)
+
+    @field_validator("host")
+    @classmethod
+    def validate_flow_host(cls, value: str) -> str:
+        return normalize_domain(value)
+
+    @field_validator("unknown_dynamic_paths")
+    @classmethod
+    def validate_unknown_paths(cls, value: list[str]) -> list[str]:
+        return _validate_flow_paths(value)
+
+    @model_validator(mode="after")
+    def validate_unknown_total(self) -> FlowMappingAsset:
+        if self.unknown_dynamic_paths_total != len(self.unknown_dynamic_paths):
+            raise ValueError("unknown_dynamic_paths_total não corresponde aos paths")
+        coordinates = [
+            (signal.flow_type, signal.basis) for signal in self.deterministic_flow_signals
+        ]
+        if len(coordinates) != len(set(coordinates)):
+            raise ValueError("sinal determinístico duplicado")
+        return self
+
+
+class FlowMappingRequest(FlowSchema):
+    batch_id: StrictStr = Field(pattern=r"^\d{4}$")
+    mapping_policy: Literal["flow-signal-policy-v1"]
+    selection_policy: RouteSelectionPolicyName
+    items: list[FlowMappingAsset] = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def refuse_duplicate_flow_asset_ids(self) -> FlowMappingRequest:
+        asset_ids = [item.asset_id for item in self.items]
+        if len(asset_ids) != len(set(asset_ids)):
+            raise ValueError("asset_id duplicado no lote de mapeamento")
+        return self
+
+
+class FlowMapping(FlowSchema):
+    flow_type: FlowType
+    basis: FlowOutputBasis
+    evidence_paths: list[FlowPath] = Field(min_length=1, max_length=100)
+    context_gaps: list[ContextGap] = Field(max_length=len(ContextGap))
+
+    @field_validator("evidence_paths")
+    @classmethod
+    def validate_mapping_paths(cls, value: list[str]) -> list[str]:
+        return _validate_flow_paths(value)
+
+    @field_validator("context_gaps")
+    @classmethod
+    def refuse_duplicate_context_gaps(cls, value: list[ContextGap]) -> list[ContextGap]:
+        if len(value) != len(set(value)):
+            raise ValueError("context_gap duplicado")
+        return value
+
+
+class FlowReviewQuestion(FlowSchema):
+    applies_to_flows: list[FlowType] = Field(min_length=1, max_length=len(FlowType))
+    required_context: list[ContextGap] = Field(min_length=1, max_length=len(ContextGap))
+    question: StrictStr = Field(min_length=20, max_length=280)
+
+    @model_validator(mode="after")
+    def refuse_duplicate_question_coordinates(self) -> FlowReviewQuestion:
+        if len(self.applies_to_flows) != len(set(self.applies_to_flows)):
+            raise ValueError("flow duplicado na pergunta")
+        if len(self.required_context) != len(set(self.required_context)):
+            raise ValueError("contexto duplicado na pergunta")
+        return self
+
+
+class FlowMappingItem(FlowSchema):
+    asset_id: StrictStr = Field(pattern=r"^asset-[0-9a-f]{64}$")
+    flow_mappings: list[FlowMapping] = Field(max_length=200)
+    review_questions: list[FlowReviewQuestion] = Field(max_length=3)
+
+
+class FlowMappingResponse(FlowSchema):
+    items: list[FlowMappingItem] = Field(max_length=20)

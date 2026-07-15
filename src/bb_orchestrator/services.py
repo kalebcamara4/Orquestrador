@@ -30,6 +30,16 @@ from bb_orchestrator.domain import (
     normalize_domain,
     parse_scope_pattern,
 )
+from bb_orchestrator.flow_policies import (
+    FLOW_SIGNAL_POLICY,
+    FLOW_TYPE_ORDER,
+    MINIMUM_CONTEXT_GAPS,
+    FlowAliasEntry,
+    FlowRelevance,
+    classify_flow_paths,
+    flow_relevance,
+    load_flow_alias_policy,
+)
 from bb_orchestrator.models import (
     AssetModel,
     CandidateModel,
@@ -54,7 +64,10 @@ from bb_orchestrator.policies import (
 from bb_orchestrator.schemas import (
     AssetStatus,
     CandidateStatus,
+    DeterministicFlowSignal,
     DnsStatus,
+    FlowMappingAsset,
+    FlowMappingRequest,
     HttpReachability,
     IngestRecord,
     QueueStatus,
@@ -230,6 +243,16 @@ class TriagePreparationResult:
     def omitted_paths(self) -> int:
         """Total omitido, mantido como conveniência para chamadores locais antigos."""
         return self.paths_omitted_by_policy + self.paths_omitted_by_limit
+
+
+@dataclass(frozen=True)
+class FlowMappingPreparationResult:
+    item_count: int
+    deterministic_signal_count: int
+    unknown_dynamic_path_count: int
+    context_required_flow_count: int
+    batch_count: int
+    paths: tuple[Path, ...]
 
 
 @dataclass(frozen=True)
@@ -2753,4 +2776,224 @@ def prepare_triage(
         paths_omitted_by_limit=sum(asset.paths_omitted_by_limit for asset in triage_assets),
         batch_count=len(serialized_batches),
         paths=paths,
+    )
+
+
+def _serialize_flow_mapping_request(request: FlowMappingRequest) -> str:
+    return (
+        json.dumps(
+            request.model_dump(mode="json"),
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
+def enforce_flow_input_policy(
+    serialized: str,
+    *,
+    aliases: Sequence[FlowAliasEntry] | None = None,
+) -> None:
+    """Revalida um lote v1 sem consultar estado externo ou aceitar campos legados."""
+    try:
+        payload = json.loads(serialized, object_pairs_hook=_object_without_duplicate_keys)
+    except PolicyViolation:
+        raise
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise PolicyViolation("flow input policy recusou JSON inválido") from exc
+    try:
+        request = FlowMappingRequest.model_validate(payload)
+    except (ValidationError, ValueError) as exc:
+        raise PolicyViolation("flow input policy recusou campos ou tipos não permitidos") from exc
+    if payload != request.model_dump(mode="json"):
+        raise PolicyViolation("flow input policy recusou payload não canônico")
+
+    if [item.asset_id for item in request.items] != sorted(item.asset_id for item in request.items):
+        raise PolicyViolation("flow input policy recusou ordenação de assets")
+
+    for item in request.items:
+        coordinates = [
+            (FLOW_TYPE_ORDER[signal.flow_type], signal.basis.value)
+            for signal in item.deterministic_flow_signals
+        ]
+        if coordinates != sorted(coordinates):
+            raise PolicyViolation("flow input policy recusou ordenação de sinais")
+        unknown = set(item.unknown_dynamic_paths)
+        for path in item.unknown_dynamic_paths:
+            if _sanitize_crawl_path(path) != path:
+                raise PolicyViolation("flow input policy recusou path desconhecido inseguro")
+            classification = classify_flow_paths([path], aliases=aliases or ())
+            if classification.signals or classification.unknown_dynamic_paths != (path,):
+                raise PolicyViolation("flow input policy recusou path desconhecido classificado")
+
+        for signal in item.deterministic_flow_signals:
+            expected_relevance = flow_relevance(signal.flow_type)
+            if signal.relevance is not expected_relevance:
+                raise PolicyViolation("flow input policy recusou relevância divergente")
+            if tuple(signal.required_context) != MINIMUM_CONTEXT_GAPS[signal.flow_type]:
+                raise PolicyViolation("flow input policy recusou lacunas mínimas divergentes")
+            if signal.evidence_paths_total < len(signal.evidence_paths):
+                raise PolicyViolation("flow input policy recusou contador de evidências")
+            for path in signal.evidence_paths:
+                if path in unknown or _sanitize_crawl_path(path) != path:
+                    raise PolicyViolation("flow input policy recusou evidência de path")
+                classification = classify_flow_paths([path], aliases=aliases or ())
+                if signal.basis.value == "DETERMINISTIC_LEXICAL_SIGNAL":
+                    valid_signal = any(
+                        candidate.flow_type is signal.flow_type and candidate.basis is signal.basis
+                        for candidate in classification.signals
+                    )
+                elif aliases is None:
+                    valid_signal = bool(
+                        classification.signals or classification.unknown_dynamic_paths
+                    )
+                else:
+                    valid_signal = any(
+                        candidate.flow_type is signal.flow_type and candidate.basis is signal.basis
+                        for candidate in classification.signals
+                    )
+                if not valid_signal:
+                    raise PolicyViolation("flow input policy recusou sinal inventado")
+
+
+def _write_flow_mapping_batches(
+    run_id: int,
+    serialized_batches: list[tuple[str, str]],
+    runs_path: Path,
+) -> tuple[Path, ...]:
+    output_dir = runs_path / str(run_id) / "llm"
+    try:
+        if output_dir.is_symlink():
+            raise InputError("caminho dos lotes de fluxo é inseguro")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for stale_path in output_dir.glob("flow-map-input-*.json"):
+            if stale_path.is_symlink():
+                raise InputError("caminho dos lotes de fluxo é inseguro")
+            stale_path.unlink()
+
+        written_paths: list[Path] = []
+        for batch_id, serialized in serialized_batches:
+            output_path = output_dir / f"flow-map-input-{batch_id}.json"
+            temporary_path = output_path.with_suffix(".json.tmp")
+            if output_path.is_symlink() or temporary_path.is_symlink():
+                raise InputError("caminho dos lotes de fluxo é inseguro")
+            try:
+                temporary_path.write_text(serialized, encoding="utf-8")
+                temporary_path.replace(output_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+            written_paths.append(output_path)
+    except InputError:
+        raise
+    except OSError as exc:
+        raise InputError(f"não foi possível gravar os lotes de fluxo: {exc}") from exc
+    return tuple(written_paths)
+
+
+def prepare_flow_mapping(
+    run_id: int,
+    session: Session,
+    *,
+    program_id: str,
+    program_directory: Path,
+    batch_size: int = DEFAULT_TRIAGE_BATCH_SIZE,
+    runs_path: Path = DEFAULT_RUNS_PATH,
+) -> FlowMappingPreparationResult:
+    """Gera exclusivamente ``flow-map-input`` com sinais locais e paths sanitizados."""
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise InputError("o tamanho do lote deve ser um número inteiro")
+    if not 1 <= batch_size <= MAX_TRIAGE_BATCH_SIZE:
+        raise InputError(f"o tamanho do lote deve estar entre 1 e {MAX_TRIAGE_BATCH_SIZE}")
+    if session.get(RunModel, run_id) is None:
+        raise InputError(f"run {run_id} não encontrada")
+    try:
+        alias_policy = load_flow_alias_policy(program_directory, program_id=program_id)
+    except ValueError as exc:
+        raise InputError(str(exc)) from exc
+
+    asset_rows = list(
+        session.execute(
+            select(AssetModel.domain)
+            .join(QueueItemModel, QueueItemModel.asset_id == AssetModel.id)
+            .join(
+                CandidateModel,
+                and_(
+                    CandidateModel.run_id == AssetModel.run_id,
+                    CandidateModel.host == AssetModel.domain,
+                ),
+            )
+            .where(
+                QueueItemModel.run_id == run_id,
+                QueueItemModel.status == QueueStatus.PENDING.value,
+                AssetModel.run_id == run_id,
+                AssetModel.status == AssetStatus.SANITIZED.value,
+                AssetModel.sanitized_at.is_not(None),
+                CandidateModel.status == CandidateStatus.APPROVED.value,
+            )
+        ).scalars()
+    )
+    patterns = _scope_patterns(session)
+    hosts = sorted({host for host in asset_rows if _is_safely_in_scope(host, patterns)})
+    if not hosts:
+        raise InputError(f"run {run_id} não possui itens sanitizados e pendentes")
+    paths_by_host = _triage_paths_by_host(run_id, session, eligible_hosts=set(hosts))
+
+    assets: list[FlowMappingAsset] = []
+    try:
+        for host in hosts:
+            # A categorização estático/dinâmico continua vindo de route-priority-v1, mas o limite
+            # histórico de priorização não pode fazer um path dinâmico desconhecido desaparecer.
+            classification = classify_flow_paths(paths_by_host[host], aliases=alias_policy.aliases)
+            signals = [
+                DeterministicFlowSignal(
+                    flow_type=signal.flow_type,
+                    basis=signal.basis,
+                    relevance=signal.relevance,
+                    evidence_paths=list(signal.evidence_paths),
+                    evidence_paths_total=signal.evidence_paths_total,
+                    required_context=list(signal.required_context),
+                )
+                for signal in classification.signals
+            ]
+            assets.append(
+                FlowMappingAsset(
+                    asset_id=_stable_asset_id(host),
+                    host=host,
+                    deterministic_flow_signals=signals,
+                    unknown_dynamic_paths=list(classification.unknown_dynamic_paths),
+                    unknown_dynamic_paths_total=len(classification.unknown_dynamic_paths),
+                )
+            )
+    except (ValidationError, ValueError) as exc:
+        raise PolicyViolation("flow input policy recusou um asset persistido") from exc
+    assets.sort(key=lambda asset: asset.asset_id)
+
+    serialized_batches: list[tuple[str, str]] = []
+    for offset in range(0, len(assets), batch_size):
+        batch_id = f"{offset // batch_size + 1:04d}"
+        request = FlowMappingRequest(
+            batch_id=batch_id,
+            mapping_policy=FLOW_SIGNAL_POLICY,
+            selection_policy=ROUTE_SELECTION_POLICY,
+            items=assets[offset : offset + batch_size],
+        )
+        serialized = _serialize_flow_mapping_request(request)
+        enforce_flow_input_policy(serialized, aliases=alias_policy.aliases)
+        serialized_batches.append((batch_id, serialized))
+
+    output_paths = _write_flow_mapping_batches(run_id, serialized_batches, runs_path)
+    return FlowMappingPreparationResult(
+        item_count=len(assets),
+        deterministic_signal_count=sum(len(asset.deterministic_flow_signals) for asset in assets),
+        unknown_dynamic_path_count=sum(asset.unknown_dynamic_paths_total for asset in assets),
+        context_required_flow_count=sum(
+            signal.relevance is FlowRelevance.CONTEXT_REQUIRED
+            for asset in assets
+            for signal in asset.deterministic_flow_signals
+        )
+        + sum(bool(asset.unknown_dynamic_paths) for asset in assets),
+        batch_count=len(serialized_batches),
+        paths=output_paths,
     )

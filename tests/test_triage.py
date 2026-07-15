@@ -841,13 +841,13 @@ def test_triage_is_isolated_by_run_and_active_program(tmp_path: Path, monkeypatc
         assert result.exit_code == 0, result.output
 
     alpha_payload = json.loads(
-        Path(".bb/programs/alpha/runs/1/llm/triage-input-0001.json").read_text()
+        Path(".bb/programs/alpha/runs/1/llm/flow-map-input-0001.json").read_text()
     )
     beta_payload = json.loads(
-        Path(".bb/programs/beta/runs/1/llm/triage-input-0001.json").read_text()
+        Path(".bb/programs/beta/runs/1/llm/flow-map-input-0001.json").read_text()
     )
-    assert alpha_payload["items"][0]["paths"] == ["/alpha"]
-    assert beta_payload["items"][0]["paths"] == ["/beta"]
+    assert alpha_payload["items"][0]["unknown_dynamic_paths"] == ["/alpha"]
+    assert beta_payload["items"][0]["unknown_dynamic_paths"] == ["/beta"]
     assert load_program("alpha").database_path != load_program("beta").database_path
 
 
@@ -879,24 +879,20 @@ def test_cli_dry_run_end_to_end(tmp_path: Path, monkeypatch) -> None:
 
     assert result.exit_code == 0, result.output
     assert (
-        "assets=2, paths incluídos=0, paths omitidos por política=0, "
-        "paths omitidos por limite=0, lotes=1"
+        "assets=2, sinais determinísticos=0, paths desconhecidos=0, "
+        "fluxos CONTEXT_REQUIRED=0, lotes=1"
     ) in result.output
-    output_path = tmp_path / ".bb/programs/test-program/runs/1/llm/triage-input-0001.json"
+    output_path = tmp_path / ".bb/programs/test-program/runs/1/llm/flow-map-input-0001.json"
     payload = json.loads(output_path.read_text())
     assert len(payload["items"]) == 2
     assert payload["selection_policy"] == "route-priority-v1"
+    assert payload["mapping_policy"] == "flow-signal-policy-v1"
     assert set(payload["items"][0]) == {
         "asset_id",
         "host",
-        "status",
-        "title",
-        "technologies",
-        "paths",
-        "paths_total",
-        "paths_included",
-        "paths_omitted_by_policy",
-        "paths_omitted_by_limit",
+        "deterministic_flow_signals",
+        "unknown_dynamic_paths",
+        "unknown_dynamic_paths_total",
     }
 
 

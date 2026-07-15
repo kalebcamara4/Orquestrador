@@ -35,6 +35,24 @@ def _migrate_legacy_database(engine: Engine) -> None:
                 "ALTER TABLE http_verification_attempts ADD COLUMN scheme VARCHAR(5)"
             )
 
+        for table_name in ("llm_triage_attempts", "llm_triage_results"):
+            llm_columns = {column["name"] for column in inspect(connection).get_columns(table_name)}
+            if "profile" not in llm_columns:
+                connection.exec_driver_sql(
+                    f"ALTER TABLE {table_name} ADD COLUMN profile VARCHAR(32) "
+                    "NOT NULL DEFAULT 'legacy_unprofiled'"
+                )
+            if "adapter_protocol_version" not in llm_columns:
+                connection.exec_driver_sql(
+                    f"ALTER TABLE {table_name} ADD COLUMN adapter_protocol_version VARCHAR(64) "
+                    "NOT NULL DEFAULT 'legacy'"
+                )
+            if "schema_version" not in llm_columns:
+                connection.exec_driver_sql(
+                    f"ALTER TABLE {table_name} ADD COLUMN schema_version VARCHAR(96) "
+                    "NOT NULL DEFAULT 'legacy'"
+                )
+
         snapshot_sql = connection.exec_driver_sql(
             "SELECT sql FROM sqlite_master "
             "WHERE type = 'table' AND name = 'execution_policy_snapshots'"

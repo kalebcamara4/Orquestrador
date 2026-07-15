@@ -166,6 +166,7 @@ def test_commands_fail_with_required_message_without_active_program(
         ["sanitize", "1"],
         ["triage", "1", "--dry-run"],
         ["llm", "status"],
+        ["llm", "ollama", "verify", "--dry-run"],
         ["llm", "triage", "1", "--dry-run"],
         ["llm", "results", "1"],
         ["queue", "list"],

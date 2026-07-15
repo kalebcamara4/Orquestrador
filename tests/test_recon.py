@@ -364,9 +364,10 @@ def test_fake_data_end_to_end_without_real_network(tmp_path: Path, monkeypatch) 
         '{"domain":"api.example.com"}\n{"domain":"dev.example.com"}\n'
     )
     triage_payload = json.loads(
-        (program_runs / "1/llm/triage-input-0001.json").read_text(encoding="utf-8")
+        (program_runs / "1/llm/flow-map-input-0001.json").read_text(encoding="utf-8")
     )
     assert {item["host"] for item in triage_payload["items"]} == {
         "api.example.com",
         "dev.example.com",
     }
+    assert all("status" not in item for item in triage_payload["items"])
