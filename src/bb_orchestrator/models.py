@@ -219,3 +219,73 @@ class QueueItemModel(Base):
     )
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+
+
+class LlmTriageAttemptModel(Base):
+    __tablename__ = "llm_triage_attempts"
+    __table_args__ = (
+        CheckConstraint(
+            "provider = 'ollama_local'",
+            name="ck_llm_triage_attempt_provider",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'validated', 'failed')",
+            name="ck_llm_triage_attempt_status",
+        ),
+        Index("ix_llm_triage_attempt_run_batch", "run_id", "batch_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("runs.id"), nullable=False, index=True)
+    program_slug: Mapped[str] = mapped_column(
+        String(64), ForeignKey("programs.slug"), nullable=False, index=True
+    )
+    batch_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    model_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    limits: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+
+class LlmTriageResultModel(Base):
+    __tablename__ = "llm_triage_results"
+    __table_args__ = (
+        CheckConstraint(
+            "provider = 'ollama_local'",
+            name="ck_llm_triage_result_provider",
+        ),
+        CheckConstraint(
+            "decision IN ('IGNORE', 'LOW_PRIORITY', 'NEEDS_REVIEW')",
+            name="ck_llm_triage_result_decision",
+        ),
+        CheckConstraint(
+            "confidence IN ('LOW', 'MEDIUM', 'HIGH')",
+            name="ck_llm_triage_result_confidence",
+        ),
+        UniqueConstraint("run_id", "asset_id", name="uq_llm_triage_result_run_asset"),
+        Index("ix_llm_triage_result_run_batch", "run_id", "batch_id", "asset_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    attempt_id: Mapped[int] = mapped_column(
+        ForeignKey("llm_triage_attempts.id"), nullable=False, index=True
+    )
+    run_id: Mapped[int] = mapped_column(ForeignKey("runs.id"), nullable=False, index=True)
+    program_slug: Mapped[str] = mapped_column(
+        String(64), ForeignKey("programs.slug"), nullable=False, index=True
+    )
+    batch_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    asset_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    decision: Mapped[str] = mapped_column(String(16), nullable=False)
+    confidence: Mapped[str] = mapped_column(String(8), nullable=False)
+    evidence: Mapped[list[dict[str, str]]] = mapped_column(JSON, nullable=False)
+    missing_context: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    manual_review_question: Mapped[str | None] = mapped_column(String(280), nullable=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    model_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    limits: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)

@@ -14,6 +14,15 @@ from bb_orchestrator.database import (
     create_sqlite_engine,
     initialize_database,
 )
+from bb_orchestrator.llm import (
+    PROMPT_VERSION,
+    LlmError,
+    configure_ollama,
+    inspect_llm_triage,
+    list_llm_results,
+    load_ollama_config,
+    run_llm_triage,
+)
 from bb_orchestrator.policies import (
     PolicyError,
     PolicyName,
@@ -74,6 +83,8 @@ ports_app = typer.Typer(help="Consulta portas abertas verificadas com segurança
 surface_app = typer.Typer(help="Consolida localmente DNS, HTTP e portas por host.")
 crawl_app = typer.Typer(help="Executa descoberta pública estritamente limitada.")
 paths_app = typer.Typer(help="Consulta caminhos públicos sanitizados.")
+llm_app = typer.Typer(help="Classifica lotes sanitizados com uma LLM estritamente local.")
+ollama_app = typer.Typer(help="Configura somente o provedor Ollama local fixo.")
 app.add_typer(scope_app, name="scope")
 app.add_typer(run_app, name="run")
 app.add_typer(queue_app, name="queue")
@@ -87,6 +98,8 @@ app.add_typer(ports_app, name="ports")
 app.add_typer(surface_app, name="surface")
 app.add_typer(crawl_app, name="crawl")
 app.add_typer(paths_app, name="paths")
+app.add_typer(llm_app, name="llm")
+llm_app.add_typer(ollama_app, name="ollama")
 
 InputFile = Annotated[
     Path,
@@ -115,6 +128,119 @@ def _session(*, announce: bool = True):
 def _abort(message: str) -> None:
     typer.echo(f"Erro: {message}", err=True)
     raise typer.Exit(code=1)
+
+
+@ollama_app.command("configure")
+def llm_ollama_configure(
+    model_id: Annotated[
+        str,
+        typer.Option("--model", help="ID local seguro de um modelo já instalado no Ollama."),
+    ],
+) -> None:
+    """Persiste apenas provider e model_id; não consulta nem modifica o Ollama."""
+    try:
+        program = require_active_program()
+    except ProgramError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        config = configure_ollama(program.database_path.parent, model_id)
+    except LlmError as exc:
+        _abort(str(exc))
+    typer.echo(f"Program: {program.slug}")
+    typer.echo(f"Provider: {config.provider}")
+    typer.echo(f"Model: {config.model_id}")
+
+
+@llm_app.command("status")
+def llm_status() -> None:
+    """Mostra somente a configuração persistida, sem conexão de rede."""
+    try:
+        program = require_active_program()
+    except ProgramError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    try:
+        config = load_ollama_config(program.database_path.parent)
+    except LlmError as exc:
+        _abort(str(exc))
+    typer.echo(f"Program: {program.slug}")
+    typer.echo(f"Provider: {config.provider}")
+    typer.echo(f"Model: {config.model_id}")
+
+
+@llm_app.command("triage")
+def llm_triage(
+    run_id: Annotated[int, typer.Argument(min=1)],
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Inspeciona somente configuração e lotes locais."),
+    ] = False,
+    confirm: Annotated[
+        bool,
+        typer.Option("--confirm", help="Confirma o POST fixo para o Ollama local."),
+    ] = False,
+) -> None:
+    """Classifica exclusivamente lotes previamente preparados por bb triage --dry-run."""
+    if dry_run == confirm:
+        _abort("escolha exatamente uma opção: --dry-run ou --confirm")
+    try:
+        program = require_active_program()
+    except ProgramError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Program: {program.slug}")
+
+    if dry_run:
+        try:
+            plan = inspect_llm_triage(
+                run_id,
+                program_directory=program.database_path.parent,
+                runs_path=program.runs_path,
+            )
+        except LlmError as exc:
+            _abort(str(exc))
+        typer.echo(f"Provider: {plan.config.provider}")
+        typer.echo(f"Model: {plan.config.model_id}")
+        typer.echo(f"Prompt: {PROMPT_VERSION}")
+        typer.echo(f"Lotes: {', '.join(plan.batch_ids)}")
+        typer.echo(f"Run {run_id}: lotes={plan.batch_count}; itens={plan.item_count}; sem conexão.")
+        return
+
+    session, _ = _program_session(announce=False)
+    with session:
+        try:
+            result = run_llm_triage(
+                run_id,
+                session,
+                program_slug=program.slug,
+                program_directory=program.database_path.parent,
+                runs_path=program.runs_path,
+            )
+        except LlmError as exc:
+            _abort(str(exc))
+    typer.echo(
+        f"Run {run_id}: lotes validados={result.batch_count}; "
+        f"itens validados={result.item_count}; arquivo={result.result_path}."
+    )
+
+
+@llm_app.command("results")
+def llm_results(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
+    """Exibe somente host, decisão, confiança e pergunta já validados."""
+    session, program = _program_session(announce=False)
+    with session:
+        try:
+            results = list_llm_results(run_id, session, runs_path=program.runs_path)
+        except LlmError as exc:
+            _abort(str(exc))
+    if not results:
+        typer.echo("Nenhum resultado validado.")
+        return
+    typer.echo("HOST  DECISÃO  CONFIANÇA  PERGUNTA")
+    for result in results:
+        question = result.manual_review_question or "-"
+        typer.echo(f"{result.host}  {result.decision}  {result.confidence}  {question}")
 
 
 @program_app.command("create")

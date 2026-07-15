@@ -5,7 +5,8 @@ O fluxo começa com descoberta passiva e aprovação humana obrigatória. Depois
 ele permite três verificações ativas mínimas: resolução DNS com `dnsx`, consulta HTTP raiz com
 `httpx` e quatro portas TCP fixas com `naabu`. Depois do mapa local, o Katana pode descobrir paths
 públicos com profundidade 1, sem autenticação, JavaScript ou headless. Não há fuzzing, nuclei ou
-integração com modelos de linguagem.
+agentes autônomos. Opcionalmente, uma LLM já instalada no Ollama local pode classificar somente os
+lotes sanitizados, sem ferramentas ou acesso aos alvos.
 Depois dessas verificações, um mapa local consolida os estados já persistidos sem gerar tráfego
 adicional.
 
@@ -21,6 +22,8 @@ adicional.
   `verify ports <run-id> --confirm`)
 - ProjectDiscovery `katana` no `PATH` (opcional; necessário somente para
   `crawl katana <run-id> --confirm`)
+- Ollama local em `127.0.0.1:11434`, com o modelo já instalado (opcional; necessário somente para
+  `llm triage <run-id> --confirm`)
 - VS Code (opcional)
 
 ## Instalação
@@ -54,6 +57,7 @@ Cada programa possui banco e artefatos próprios:
 ├── current-program.json
 └── programs/<slug>/
     ├── orchestrator.db
+    ├── llm-config.json (opcional)
     └── runs/
 ```
 
@@ -81,15 +85,17 @@ bb program select
 
 Arquivar retira o programa do seletor e limpa a seleção se ele estiver ativo, mas nunca apaga seu
 banco nem seus artefatos. Sem programa ativo, comandos como `scope`, `recon`, `run`, `candidates`,
-`policy`, `verify`, `ports`, `surface`, `crawl`, `paths`, `assets`, `sanitize`, `queue` e `triage`
+`policy`, `verify`, `ports`, `surface`, `crawl`, `paths`, `assets`, `sanitize`, `queue`, `triage` e
+`llm`
 recusam a operação com:
 
 ```text
 Nenhum programa selecionado. Execute: bb program select
 ```
 
-Todo comando que usa dados mostra `Program: <slug>` e acessa exclusivamente o banco e o diretório
-`runs/` desse programa.
+Os comandos acessam exclusivamente o banco e o diretório `runs/` do programa ativo. Em geral, a
+CLI também mostra `Program: <slug>`; `bb llm results` omite metadados para exibir somente as quatro
+colunas seguras definidas adiante.
 
 O fluxo seguro é:
 
@@ -100,6 +106,7 @@ scope import → recon passivo → candidatos em escopo → aprovação humana
              → descoberta pública de paths → mapa local atualizado
              → assets list/export
              → sanitize → fila → triage --dry-run
+             → classificação local opcional → revisão humana
 ```
 
 ### Política de execução do programa
@@ -564,7 +571,49 @@ gravado. Uma run inexistente ou sem itens sanitizados e pendentes também falha 
 A seleção serve somente para reduzir contexto. As categorias não representam severidade, não
 afirmam vulnerabilidade, não confirmam autorização ou acesso a conteúdo e não constituem PoC.
 
-O schema estrito reservado para uma futura resposta é:
+### 8. Classifique os lotes com uma LLM local, sem ferramentas
+
+A integração de LLM é um **analista local limitado**, não um agente autônomo. Ela lê exclusivamente
+os arquivos `triage-input-*.json` já criados pelo comando anterior e envia um lote por vez ao
+endpoint fixo `http://127.0.0.1:11434/api/chat`. Ela não lê SQLite de superfície, responses HTTP,
+headers, cookies, IPs, portas, artefatos brutos ou qualquer outro arquivo para montar o contexto.
+Também não recebe ferramentas e não pode fazer requisições contra alvos, executar comandos, gerar
+PoC ou confirmar vulnerabilidades.
+
+O orquestrador não inicia o Ollama, não baixa modelos, não executa `ollama pull` e não altera a
+configuração do serviço. Instale e disponibilize o modelo separadamente; depois persista somente o
+ID local para o programa ativo:
+
+```bash
+bb llm ollama configure --model qwen2.5:7b
+bb llm status
+```
+
+O arquivo `.bb/programs/<slug>/llm-config.json` contém apenas `provider=ollama_local` e `model_id`.
+Não há URL, hostname, porta, proxy ou API key configurável. `bb llm status` apenas mostra esse
+arquivo local; ele não testa disponibilidade nem chama a LLM. IDs marcados como modelos `cloud`
+são recusados para impedir encaminhamento indireto a um provedor remoto.
+
+Antes de qualquer conexão, inspecione o plano. O dry-run mostra lotes, itens, modelo e a versão do
+prompt, mas não abre conexão:
+
+```bash
+bb llm triage 1 --dry-run
+```
+
+A chamada exige confirmação explícita:
+
+```bash
+bb llm triage 1 --confirm
+bb llm results 1
+```
+
+Cada lote é processado serialmente, sem retry, com timeout fixo de 90 segundos, `stream: false`,
+temperatura zero e output estruturado por schema JSON. Proxies do ambiente e redirects HTTP são
+bloqueados. Indisponibilidade do serviço ou do modelo produz erro sanitizado; o corpo bruto da
+resposta do Ollama, conteúdo inválido e raciocínio interno nunca são persistidos.
+
+O schema estrito de resposta é:
 
 ```json
 {
@@ -573,17 +622,27 @@ O schema estrito reservado para uma futura resposta é:
       "asset_id": "asset-<sha256>",
       "decision": "IGNORE|LOW_PRIORITY|NEEDS_REVIEW",
       "confidence": "LOW|MEDIUM|HIGH",
-      "evidence": [],
-      "missing_context": [],
-      "manual_review_question": null
+      "evidence": [
+        {"kind": "PATH|HTTP_STATUS|TECHNOLOGY", "value": "valor exato do lote"}
+      ],
+      "missing_context": [
+        "AUTHORIZATION|USER_ROLE|RESPONSE_BEHAVIOR|BUSINESS_RULE|OTHER"
+      ],
+      "manual_review_question": "Pergunta defensiva curta ou null"
     }
   ]
 }
 ```
 
-Nesta etapa, `triage` exige explicitamente `--dry-run`. Ele apenas lê o SQLite e grava arquivos
-locais. Não existe cliente de LLM, LiteLLM, Ollama, LM Studio, API externa, subprocesso, tráfego de
-rede ou transmissão de dados.
+Cada asset do lote deve aparecer exatamente uma vez. IDs extras, campos inesperados, JSON com
+texto adicional, enums inválidas, evidências inventadas e perguntas inseguras fazem o lote falhar
+fechado. Os resultados só são substituídos após todos os lotes da execução serem validados. O
+artefato determinístico contém apenas dados validados em
+`.bb/programs/<slug>/runs/<run-id>/llm/results/triage-results.json`.
+
+`bb llm results` mostra somente `HOST`, `DECISÃO`, `CONFIANÇA` e `PERGUNTA`. A decisão
+`NEEDS_REVIEW` é apenas uma hipótese de priorização para validação humana; não é um achado, não
+confirma vulnerabilidade e não substitui autorização ou revisão manual.
 
 ## Bancos locais isolados
 
@@ -593,7 +652,8 @@ programas. O arquivo `.bb/current-program.json` contém somente o slug atualment
 
 As tabelas incluem `programs`, `program_policies`, `execution_policy_snapshots`, `scope_rules`,
 `runs`, `candidates`, `dns_verification_attempts`, `http_verification_attempts`,
-`port_observations`, `crawl_paths`, `assets` e `queue_items`. Cada banco
+`port_observations`, `crawl_paths`, `assets`, `queue_items`, `llm_triage_attempts` e
+`llm_triage_results`. Cada banco
 armazena apenas os metadados e dados daquele programa: regras, hosts normalizados, fonte, estados,
 timestamps, contadores, referências e hashes SHA-256. O conteúdo bruto e o caminho do JSONL
 manual não são persistidos. As saídas reduzidas e entradas seguras existem somente no diretório
@@ -623,7 +683,10 @@ ruff format .
 
 ## Limites desta entrega
 
-- Sem LLMs, LiteLLM, DeepSeek ou GPT-OSS.
+- A única LLM suportada é um modelo já instalado no Ollama local, acessado no endpoint fixo de
+  loopback. Sem LiteLLM, LM Studio, DeepSeek ou provedores remotos.
+- A LLM somente classifica prioridade e formula perguntas defensivas sobre lotes sanitizados; sem
+  ferramentas, ações contra alvos, comandos, PoC ou confirmação de vulnerabilidade.
 - Sem GUI, servidor web ou Docker.
 - A descoberta de hosts é somente o subfinder passivo, após `--confirm`.
 - A verificação DNS usa somente dnsx, com 5 threads e 5 DNS/s, após aprovação humana.

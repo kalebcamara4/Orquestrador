@@ -165,6 +165,9 @@ def test_commands_fail_with_required_message_without_active_program(
         ["policy", "set", "conservative"],
         ["sanitize", "1"],
         ["triage", "1", "--dry-run"],
+        ["llm", "status"],
+        ["llm", "triage", "1", "--dry-run"],
+        ["llm", "results", "1"],
         ["queue", "list"],
     ]
     results = [runner.invoke(app, command) for command in commands]

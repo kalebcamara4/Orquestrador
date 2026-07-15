@@ -244,16 +244,32 @@ class TriageBatch(_TriageItems):
 
 
 class TriageRequest(_TriageItems):
-    """Payload serializado de uma futura requisição de triagem."""
+    """Payload serializado de uma requisição local de triagem."""
+
+
+class TriageEvidence(TriageSchema):
+    kind: Literal["PATH", "HTTP_STATUS", "TECHNOLOGY"]
+    value: StrictStr = Field(min_length=1, max_length=512)
 
 
 class TriageDecision(TriageSchema):
     asset_id: StrictStr = Field(min_length=1, max_length=80)
     decision: Literal["IGNORE", "LOW_PRIORITY", "NEEDS_REVIEW"]
     confidence: Literal["LOW", "MEDIUM", "HIGH"]
-    evidence: list[StrictStr] = Field(max_length=50)
-    missing_context: list[StrictStr] = Field(max_length=50)
-    manual_review_question: StrictStr | None = Field(max_length=500)
+    evidence: list[TriageEvidence] = Field(max_length=3)
+    missing_context: list[
+        Literal["AUTHORIZATION", "USER_ROLE", "RESPONSE_BEHAVIOR", "BUSINESS_RULE", "OTHER"]
+    ] = Field(max_length=5)
+    manual_review_question: StrictStr | None = Field(max_length=280)
+
+    @model_validator(mode="after")
+    def refuse_duplicate_values(self) -> TriageDecision:
+        evidence = [(item.kind, item.value) for item in self.evidence]
+        if len(evidence) != len(set(evidence)):
+            raise ValueError("evidência duplicada")
+        if len(self.missing_context) != len(set(self.missing_context)):
+            raise ValueError("missing_context duplicado")
+        return self
 
 
 class TriageResponse(TriageSchema):

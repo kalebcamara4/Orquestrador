@@ -39,6 +39,8 @@ def test_database_contains_the_corresponding_tables(tmp_path: Path) -> None:
         "dns_verification_attempts",
         "execution_policy_snapshots",
         "http_verification_attempts",
+        "llm_triage_attempts",
+        "llm_triage_results",
         "port_observations",
         "program_policies",
         "programs",
