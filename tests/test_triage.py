@@ -18,11 +18,14 @@ from bb_orchestrator.database import (
 from bb_orchestrator.models import (
     AssetModel,
     CandidateModel,
+    CrawlPathModel,
+    ExecutionPolicySnapshotModel,
+    HttpVerificationAttemptModel,
     QueueItemModel,
     RunModel,
     ScopeRuleModel,
 )
-from bb_orchestrator.programs import create_program, select_program
+from bb_orchestrator.programs import create_program, load_program, select_program
 from bb_orchestrator.schemas import (
     AssetStatus,
     QueueStatus,
@@ -99,6 +102,83 @@ def _domains(count: int) -> list[str]:
     return [f"host-{index:02d}.example.com" for index in range(count)]
 
 
+def _add_http(
+    session,
+    run_id: int,
+    host: str,
+    *,
+    status: int = 200,
+    title: str | None = None,
+    technologies: list[str] | None = None,
+) -> None:
+    candidate = session.scalar(
+        select(CandidateModel).where(
+            CandidateModel.run_id == run_id,
+            CandidateModel.host == host,
+        )
+    )
+    assert candidate is not None
+    session.add(
+        HttpVerificationAttemptModel(
+            run_id=run_id,
+            candidate_id=candidate.id,
+            program_slug="test-program",
+            host=host,
+            reachability="reachable",
+            status_code=status,
+            scheme="https",
+            title=title,
+            technologies=technologies,
+            verified_at=datetime.now(UTC),
+        )
+    )
+    session.commit()
+
+
+def _add_paths(
+    session,
+    run_id: int,
+    host: str,
+    paths: list[str],
+    *,
+    program_slug: str = "test-program",
+) -> None:
+    snapshot = session.scalar(
+        select(ExecutionPolicySnapshotModel)
+        .where(
+            ExecutionPolicySnapshotModel.run_id == run_id,
+            ExecutionPolicySnapshotModel.step == "katana",
+        )
+        .limit(1)
+    )
+    if snapshot is None:
+        snapshot = ExecutionPolicySnapshotModel(
+            run_id=run_id,
+            program_slug=program_slug,
+            step="katana",
+            snapshot={
+                "name": "conservative",
+                "version": "2",
+                "parameters": {"max_paths_per_host": 100},
+            },
+        )
+        session.add(snapshot)
+        session.flush()
+    now = datetime.now(UTC)
+    session.add_all(
+        CrawlPathModel(
+            run_id=run_id,
+            host=host,
+            path=path,
+            source="katana",
+            observed_at=now,
+            policy_snapshot_id=snapshot.id,
+        )
+        for path in paths
+    )
+    session.commit()
+
+
 @pytest.mark.parametrize(
     ("item_count", "expected_batch_sizes"),
     [
@@ -141,6 +221,119 @@ def test_configurable_batch_size_accepts_twenty_as_maximum(tmp_path: Path, sessi
     assert [len(json.loads(path.read_text())["items"]) for path in result.paths] == [20, 1]
 
 
+def test_triage_uses_sanitized_sqlite_surface_and_ignores_paths_artifact(
+    tmp_path: Path,
+    session,
+) -> None:
+    run = _add_run(session, ["api.example.com", "without-crawl.example.com"])
+    _add_http(
+        session,
+        run.id,
+        "api.example.com",
+        status=404,
+        title="Old title",
+        technologies=["OldTech"],
+    )
+    _add_http(
+        session,
+        run.id,
+        "api.example.com",
+        status=200,
+        title="Safe Title",
+        technologies=["nginx", "React"],
+    )
+    _add_paths(
+        session,
+        run.id,
+        "api.example.com",
+        ["/login", "/", "/api/v1/users"],
+    )
+    poisoned_artifact = tmp_path / "runs" / str(run.id) / "crawl" / "paths.jsonl"
+    poisoned_artifact.parent.mkdir(parents=True)
+    poisoned_artifact.write_text(
+        '{"host":"api.example.com","path":"/artifact-only","source":"katana"}\n',
+        encoding="utf-8",
+    )
+
+    result = prepare_triage(run.id, session, runs_path=tmp_path / "runs")
+    payload = json.loads(result.paths[0].read_text())
+    by_host = {item["host"]: item for item in payload["items"]}
+
+    assert (result.item_count, result.included_paths, result.omitted_paths) == (2, 3, 0)
+    assert by_host["api.example.com"] == {
+        "asset_id": services._stable_asset_id("api.example.com"),
+        "host": "api.example.com",
+        "status": 200,
+        "title": "Safe Title",
+        "technologies": ["nginx", "React"],
+        "paths": ["/", "/api/v1/users", "/login"],
+        "paths_total": 3,
+    }
+    assert by_host["without-crawl.example.com"]["paths"] == []
+    assert by_host["without-crawl.example.com"]["paths_total"] == 0
+    assert "/artifact-only" not in result.paths[0].read_text()
+
+
+def test_triage_limits_paths_to_fifty_and_counts_omitted(tmp_path: Path, session) -> None:
+    run = _add_run(session, ["api.example.com"])
+    all_paths = [f"/path/{index:03d}" for index in reversed(range(60))]
+    _add_paths(session, run.id, "api.example.com", all_paths)
+
+    result = prepare_triage(run.id, session, runs_path=tmp_path / "runs")
+    item = json.loads(result.paths[0].read_text())["items"][0]
+
+    assert item["paths"] == [f"/path/{index:03d}" for index in range(50)]
+    assert item["paths_total"] == 60
+    assert (result.included_paths, result.omitted_paths) == (50, 10)
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        "/https://outside.example/private",
+        "/login?next=/admin",
+        "/login#fragment",
+        "/outside.example/private",
+        "/192.0.2.10/admin",
+        "/admin:8443",
+        "/token/raw-secret",
+        "/person@example.com",
+        "/+55-11-99999-9999",
+        "/control\x00value",
+    ],
+)
+def test_triage_rejects_unsafe_persisted_paths_before_writing(
+    tmp_path: Path,
+    session,
+    unsafe_path: str,
+) -> None:
+    run = _add_run(session, ["api.example.com"])
+    _add_paths(session, run.id, "api.example.com", [unsafe_path])
+
+    with pytest.raises(PolicyViolation, match="path persistido"):
+        prepare_triage(run.id, session, runs_path=tmp_path / "runs")
+
+    assert not (tmp_path / "runs").exists()
+
+
+def test_triage_rejects_noncanonical_persisted_http_before_writing(
+    tmp_path: Path,
+    session,
+) -> None:
+    run = _add_run(session, ["api.example.com"])
+    _add_http(
+        session,
+        run.id,
+        "api.example.com",
+        title="https://outside.example/private?token=raw-secret",
+    )
+
+    with pytest.raises(PolicyViolation, match="título HTTP persistido"):
+        prepare_triage(run.id, session, runs_path=tmp_path / "runs")
+
+    assert not (tmp_path / "runs").exists()
+
+
 @pytest.mark.parametrize("batch_size", [0, 21, True, 10.5])
 def test_service_refuses_invalid_batch_sizes(tmp_path: Path, session, batch_size) -> None:
     run = _add_run(session, ["example.com"])
@@ -178,11 +371,20 @@ def test_triage_schemas_refuse_extra_fields_and_invalid_response_values() -> Non
         "title": None,
         "technologies": [],
         "paths": [],
+        "paths_total": 0,
     }
     with pytest.raises(ValidationError):
         TriageAsset.model_validate({**item, "url": "https://example.com"})
     with pytest.raises(ValidationError):
         TriageAsset.model_validate({key: value for key, value in item.items() if key != "paths"})
+    with pytest.raises(ValidationError):
+        TriageAsset.model_validate(
+            {key: value for key, value in item.items() if key != "paths_total"}
+        )
+    with pytest.raises(ValidationError):
+        TriageAsset.model_validate({**item, "paths": ["/login"], "paths_total": 0})
+    with pytest.raises(ValidationError):
+        TriageAsset.model_validate({**item, "paths": ["/z", "/a"], "paths_total": 2})
     with pytest.raises(ValidationError):
         TriageRequest.model_validate(
             {"batch_id": "0001", "items": [item], "headers": {"X-Test": "value"}}
@@ -246,6 +448,40 @@ def test_policy_gate_blocks_prohibited_patterns(forbidden_value: str) -> None:
                 "title": forbidden_value,
                 "technologies": [],
                 "paths": [],
+                "paths_total": 0,
+            }
+        ],
+    }
+
+    with pytest.raises(PolicyViolation):
+        enforce_triage_policy(json.dumps(payload))
+
+
+@pytest.mark.parametrize(
+    "forbidden_path",
+    [
+        "/https://outside.example/private",
+        "/login?token=secret",
+        "/outside.example",
+        "/192.0.2.10",
+        "/admin:8443",
+        "/token/raw-secret",
+        "/person@example.com",
+        "/control\x00value",
+    ],
+)
+def test_policy_gate_blocks_prohibited_paths(forbidden_path: str) -> None:
+    payload = {
+        "batch_id": "0001",
+        "items": [
+            {
+                "asset_id": "asset-1",
+                "host": "example.com",
+                "status": None,
+                "title": None,
+                "technologies": [],
+                "paths": [forbidden_path],
+                "paths_total": 1,
             }
         ],
     }
@@ -265,6 +501,7 @@ def test_policy_gate_blocks_extra_fields_in_serialized_json() -> None:
                 "title": None,
                 "technologies": [],
                 "paths": [],
+                "paths_total": 0,
                 "body": "raw HTTP body",
             }
         ],
@@ -338,11 +575,21 @@ def test_serialized_json_is_reproducible_for_same_input(tmp_path: Path, session)
     run = _add_run(session, _domains(11))
     first = prepare_triage(run.id, session, runs_path=tmp_path / "runs")
     first_contents = {path.name: path.read_bytes() for path in first.paths}
+    output_dir = tmp_path / "runs" / str(run.id) / "llm"
+    keep_path = output_dir / "keep.txt"
+    keep_path.write_text("preserve", encoding="utf-8")
+    (output_dir / "triage-input-9999.json").write_text("stale", encoding="utf-8")
 
     second = prepare_triage(run.id, session, runs_path=tmp_path / "runs")
     second_contents = {path.name: path.read_bytes() for path in second.paths}
 
     assert first_contents == second_contents
+    assert keep_path.read_text(encoding="utf-8") == "preserve"
+    assert sorted(path.name for path in output_dir.iterdir()) == [
+        "keep.txt",
+        "triage-input-0001.json",
+        "triage-input-0002.json",
+    ]
 
 
 def test_preparation_makes_zero_network_calls(tmp_path: Path, session, monkeypatch) -> None:
@@ -353,10 +600,108 @@ def test_preparation_makes_zero_network_calls(tmp_path: Path, session, monkeypat
 
     monkeypatch.setattr(socket, "socket", refuse_network)
     monkeypatch.setattr(socket, "create_connection", refuse_network)
+    monkeypatch.setattr(services.subprocess, "run", refuse_network)
+    monkeypatch.setattr(services.shutil, "which", refuse_network)
 
     result = prepare_triage(run.id, session, runs_path=tmp_path / "runs")
 
     assert result.item_count == 1
+
+
+def test_triage_does_not_consume_or_mutate_persisted_state(tmp_path: Path, session) -> None:
+    run = _add_run(session, ["api.example.com"])
+    _add_http(session, run.id, "api.example.com", title="Safe")
+    _add_paths(session, run.id, "api.example.com", ["/", "/login"])
+
+    def state() -> tuple[object, ...]:
+        return (
+            tuple(
+                session.execute(
+                    select(CandidateModel.id, CandidateModel.status).order_by(CandidateModel.id)
+                ).all()
+            ),
+            tuple(
+                session.execute(
+                    select(AssetModel.id, AssetModel.status).order_by(AssetModel.id)
+                ).all()
+            ),
+            tuple(
+                session.execute(
+                    select(QueueItemModel.id, QueueItemModel.status).order_by(QueueItemModel.id)
+                ).all()
+            ),
+            tuple(
+                session.execute(
+                    select(
+                        HttpVerificationAttemptModel.id,
+                        HttpVerificationAttemptModel.status_code,
+                    ).order_by(HttpVerificationAttemptModel.id)
+                ).all()
+            ),
+            tuple(
+                session.execute(
+                    select(CrawlPathModel.id, CrawlPathModel.path).order_by(CrawlPathModel.id)
+                ).all()
+            ),
+            tuple(
+                session.scalars(
+                    select(ExecutionPolicySnapshotModel.id).order_by(
+                        ExecutionPolicySnapshotModel.id
+                    )
+                )
+            ),
+        )
+
+    before = state()
+    prepare_triage(run.id, session, runs_path=tmp_path / "runs")
+    session.expire_all()
+
+    assert state() == before
+
+
+def test_triage_is_isolated_by_run_and_active_program(tmp_path: Path, monkeypatch) -> None:
+    direct_engine = create_sqlite_engine(tmp_path / "runs.db")
+    initialize_database(direct_engine)
+    with create_session_factory(direct_engine)() as direct_session:
+        first_run = _add_run(direct_session, ["api.example.com"])
+        second_run = _add_run(direct_session, ["api.example.com"])
+        _add_paths(direct_session, first_run.id, "api.example.com", ["/run-one"])
+        _add_paths(direct_session, second_run.id, "api.example.com", ["/run-two"])
+        first = prepare_triage(first_run.id, direct_session, runs_path=tmp_path / "direct")
+        second = prepare_triage(second_run.id, direct_session, runs_path=tmp_path / "direct")
+        assert json.loads(first.paths[0].read_text())["items"][0]["paths"] == ["/run-one"]
+        assert json.loads(second.paths[0].read_text())["items"][0]["paths"] == ["/run-two"]
+
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    for slug, host, expected_path in (
+        ("alpha", "alpha.example.com", "/alpha"),
+        ("beta", "beta.example.com", "/beta"),
+    ):
+        program = create_program(slug, slug.title())
+        engine = create_sqlite_engine(program.database_path)
+        with create_session_factory(engine)() as program_session:
+            run = _add_run(program_session, [host])
+            _add_paths(
+                program_session,
+                run.id,
+                host,
+                [expected_path],
+                program_slug=slug,
+            )
+        select_program(slug)
+        result = runner.invoke(app, ["triage", "1", "--dry-run"])
+        assert result.exit_code == 0, result.output
+
+    alpha_payload = json.loads(
+        Path(".bb/programs/alpha/runs/1/llm/triage-input-0001.json").read_text()
+    )
+    beta_payload = json.loads(
+        Path(".bb/programs/beta/runs/1/llm/triage-input-0001.json").read_text()
+    )
+    assert alpha_payload["items"][0]["paths"] == ["/alpha"]
+    assert beta_payload["items"][0]["paths"] == ["/beta"]
+    assert load_program("alpha").database_path != load_program("beta").database_path
 
 
 def test_cli_dry_run_end_to_end(tmp_path: Path, monkeypatch) -> None:
@@ -367,6 +712,8 @@ def test_cli_dry_run_end_to_end(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setattr(socket, "socket", refuse_network)
     monkeypatch.setattr(socket, "create_connection", refuse_network)
+    monkeypatch.setattr(services.subprocess, "run", refuse_network)
+    monkeypatch.setattr(services.shutil, "which", refuse_network)
     monkeypatch.chdir(tmp_path)
     create_program("test-program", "Test Program")
     select_program("test-program")
@@ -384,7 +731,7 @@ def test_cli_dry_run_end_to_end(tmp_path: Path, monkeypatch) -> None:
     result = runner.invoke(app, ["triage", "1", "--dry-run"], env=env)
 
     assert result.exit_code == 0, result.output
-    assert "itens=2, lotes=1" in result.output
+    assert "assets=2, paths incluídos=0, paths omitidos=0, lotes=1" in result.output
     output_path = tmp_path / ".bb/programs/test-program/runs/1/llm/triage-input-0001.json"
     payload = json.loads(output_path.read_text())
     assert len(payload["items"]) == 2
@@ -395,6 +742,7 @@ def test_cli_dry_run_end_to_end(tmp_path: Path, monkeypatch) -> None:
         "title",
         "technologies",
         "paths",
+        "paths_total",
     }
 
 

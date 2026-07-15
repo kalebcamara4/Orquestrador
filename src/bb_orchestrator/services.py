@@ -69,6 +69,7 @@ from bb_orchestrator.schemas import (
 
 DEFAULT_TRIAGE_BATCH_SIZE = 10
 MAX_TRIAGE_BATCH_SIZE = 20
+MAX_TRIAGE_PATHS_PER_ASSET = 50
 DEFAULT_RUNS_PATH = Path("runs")
 SUBFINDER_TIMEOUT_SECONDS = 300
 HTTP_TITLE_MAX_LENGTH = 200
@@ -176,6 +177,8 @@ class SanitizeResult:
 @dataclass(frozen=True)
 class TriagePreparationResult:
     item_count: int
+    included_paths: int
+    omitted_paths: int
     batch_count: int
     paths: tuple[Path, ...]
 
@@ -336,6 +339,15 @@ class _HttpObservation:
     reachability: str
     status_code: int | None
     scheme: str | None
+    title: str | None
+    technologies: list[str] | None
+
+
+@dataclass(frozen=True)
+class _TriageHttpObservation:
+    host: str
+    reachability: str
+    status_code: int | None
     title: str | None
     technologies: list[str] | None
 
@@ -2401,6 +2413,14 @@ def enforce_triage_policy(serialized: str) -> None:
     if payload != request.model_dump(mode="json"):
         raise PolicyViolation("policy gate recusou payload não canônico")
 
+    for item_index, item in enumerate(request.items):
+        for path_index, path in enumerate(item.paths):
+            if _sanitize_crawl_path(path) != path:
+                raise PolicyViolation(
+                    "policy gate recusou path fora da allowlist em "
+                    f"$.items[{item_index}].paths[{path_index}]"
+                )
+
     for field_path, value in _iter_string_values(payload):
         reason = _forbidden_reason(value)
         if reason is not None:
@@ -2445,6 +2465,86 @@ def _write_triage_batches(
     return tuple(written_paths)
 
 
+def _triage_http_metadata(
+    attempt: _TriageHttpObservation | None,
+    *,
+    expected_host: str,
+) -> tuple[int | None, str | None, list[str]]:
+    if attempt is None:
+        return None, None, []
+    try:
+        canonical_host = normalize_domain(attempt.host)
+    except (InvalidDomain, TypeError, ValueError) as exc:
+        raise PolicyViolation("policy gate recusou host HTTP persistido") from exc
+    if canonical_host != attempt.host or canonical_host != expected_host:
+        raise PolicyViolation("policy gate recusou associação de host HTTP persistido")
+    if attempt.reachability not in {
+        HttpReachability.PENDING.value,
+        HttpReachability.REACHABLE.value,
+        HttpReachability.UNREACHABLE.value,
+    }:
+        raise PolicyViolation("policy gate recusou reachability HTTP persistido")
+
+    status = attempt.status_code
+    if status is not None and (
+        isinstance(status, bool) or not isinstance(status, int) or not 100 <= status <= 599
+    ):
+        raise PolicyViolation("policy gate recusou status HTTP persistido")
+
+    title = attempt.title
+    if title is not None:
+        sanitized_title = _sanitize_http_text(title, max_length=HTTP_TITLE_MAX_LENGTH)
+        if sanitized_title != title:
+            raise PolicyViolation("policy gate recusou título HTTP persistido")
+
+    raw_technologies = attempt.technologies
+    if raw_technologies in (None, []):
+        technologies: list[str] = []
+    else:
+        technologies = _sanitize_http_technologies(raw_technologies) or []
+        if technologies != raw_technologies:
+            raise PolicyViolation("policy gate recusou tecnologias HTTP persistidas")
+
+    if attempt.reachability != HttpReachability.REACHABLE.value:
+        if status is not None or title is not None or technologies:
+            raise PolicyViolation("policy gate recusou metadados de HTTP não alcançável")
+        return None, None, []
+    if status is None:
+        raise PolicyViolation("policy gate recusou HTTP reachable sem status")
+    return status, title, technologies
+
+
+def _triage_paths_by_host(
+    run_id: int,
+    session: Session,
+    *,
+    eligible_hosts: set[str],
+) -> dict[str, list[str]]:
+    paths_by_host: dict[str, set[str]] = {host: set() for host in eligible_hosts}
+    if not eligible_hosts:
+        return {}
+    records = session.execute(
+        select(CrawlPathModel.host, CrawlPathModel.path, CrawlPathModel.source)
+        .where(
+            CrawlPathModel.run_id == run_id,
+            CrawlPathModel.host.in_(eligible_hosts),
+        )
+        .order_by(CrawlPathModel.host, CrawlPathModel.path)
+    )
+    for host, path, source in records:
+        if source != "katana":
+            raise PolicyViolation("policy gate recusou source de path persistido")
+        try:
+            canonical_host = normalize_domain(host)
+        except (InvalidDomain, TypeError, ValueError) as exc:
+            raise PolicyViolation("policy gate recusou host de path persistido") from exc
+        canonical_path = _sanitize_crawl_path(path)
+        if canonical_host != host or canonical_path != path:
+            raise PolicyViolation("policy gate recusou path persistido fora da allowlist")
+        paths_by_host[host].add(path)
+    return {host: sorted(paths) for host, paths in paths_by_host.items()}
+
+
 def prepare_triage(
     run_id: int,
     session: Session,
@@ -2462,9 +2562,9 @@ def prepare_triage(
     if run is None:
         raise InputError(f"run {run_id} não encontrada")
 
-    assets = list(
-        session.scalars(
-            select(AssetModel)
+    asset_rows = list(
+        session.execute(
+            select(AssetModel.domain, CandidateModel.id)
             .join(QueueItemModel, QueueItemModel.asset_id == AssetModel.id)
             .join(
                 CandidateModel,
@@ -2484,22 +2584,69 @@ def prepare_triage(
         ).all()
     )
     patterns = _scope_patterns(session)
-    assets = [asset for asset in assets if _is_safely_in_scope(asset.domain, patterns)]
-    if not assets:
+    asset_rows = [
+        (host, candidate_id)
+        for host, candidate_id in asset_rows
+        if _is_safely_in_scope(host, patterns)
+    ]
+    if not asset_rows:
         raise InputError(f"run {run_id} não possui itens sanitizados e pendentes")
 
+    candidate_ids = {candidate_id for _, candidate_id in asset_rows}
+    latest_http_ids = (
+        select(func.max(HttpVerificationAttemptModel.id))
+        .where(
+            HttpVerificationAttemptModel.run_id == run_id,
+            HttpVerificationAttemptModel.candidate_id.in_(candidate_ids),
+        )
+        .group_by(HttpVerificationAttemptModel.candidate_id)
+    )
+    latest_http = {
+        candidate_id: _TriageHttpObservation(
+            host=host,
+            reachability=reachability,
+            status_code=status_code,
+            title=title,
+            technologies=technologies,
+        )
+        for candidate_id, host, reachability, status_code, title, technologies in session.execute(
+            select(
+                HttpVerificationAttemptModel.candidate_id,
+                HttpVerificationAttemptModel.host,
+                HttpVerificationAttemptModel.reachability,
+                HttpVerificationAttemptModel.status_code,
+                HttpVerificationAttemptModel.title,
+                HttpVerificationAttemptModel.technologies,
+            ).where(HttpVerificationAttemptModel.id.in_(latest_http_ids))
+        )
+    }
+    triage_paths = _triage_paths_by_host(
+        run_id,
+        session,
+        eligible_hosts={host for host, _ in asset_rows},
+    )
+
     try:
-        triage_assets = [
-            TriageAsset(
-                asset_id=_stable_asset_id(asset.domain),
-                host=asset.domain,
-                status=None,
-                title=None,
-                technologies=[],
-                paths=[],
+        triage_assets: list[TriageAsset] = []
+        for host, candidate_id in asset_rows:
+            status, title, technologies = _triage_http_metadata(
+                latest_http.get(candidate_id),
+                expected_host=host,
             )
-            for asset in assets
-        ]
+            all_paths = triage_paths[host]
+            triage_assets.append(
+                TriageAsset(
+                    asset_id=_stable_asset_id(host),
+                    host=host,
+                    status=status,
+                    title=title,
+                    technologies=technologies,
+                    paths=all_paths[:MAX_TRIAGE_PATHS_PER_ASSET],
+                    paths_total=len(all_paths),
+                )
+            )
+    except PolicyViolation:
+        raise
     except (ValidationError, ValueError) as exc:
         raise PolicyViolation("policy gate recusou um asset persistido") from exc
     triage_assets.sort(key=lambda asset: asset.asset_id)
@@ -2521,8 +2668,12 @@ def prepare_triage(
         serialized_batches.append((batch_id, serialized))
 
     paths = _write_triage_batches(run_id, serialized_batches, runs_path)
+    included_paths = sum(len(asset.paths) for asset in triage_assets)
+    total_paths = sum(asset.paths_total for asset in triage_assets)
     return TriagePreparationResult(
         item_count=len(triage_assets),
+        included_paths=included_paths,
+        omitted_paths=total_paths - included_paths,
         batch_count=len(serialized_batches),
         paths=paths,
     )

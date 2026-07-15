@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Literal
@@ -178,12 +179,38 @@ class TriageAsset(TriageSchema):
     status: StrictInt | None = Field(ge=100, le=599)
     title: StrictStr | None = Field(max_length=500)
     technologies: list[StrictStr] = Field(max_length=50)
-    paths: list[StrictStr] = Field(max_length=100)
+    paths: list[Annotated[StrictStr, Field(min_length=1, max_length=512)]] = Field(max_length=50)
+    paths_total: StrictInt = Field(ge=0)
 
     @field_validator("host")
     @classmethod
     def validate_host(cls, value: str) -> str:
         return normalize_domain(value)
+
+    @field_validator("paths")
+    @classmethod
+    def validate_paths(cls, value: list[str]) -> list[str]:
+        if value != sorted(set(value)):
+            raise ValueError("paths devem ser únicos e ordenados")
+        for path in value:
+            if not path.startswith("/") or path.startswith("//"):
+                raise ValueError("path relativo inválido")
+            if "?" in path or "#" in path:
+                raise ValueError("query string ou fragmento não permitido")
+            if any(unicodedata.category(character).startswith("C") for character in path):
+                raise ValueError("caractere de controle não permitido")
+        return value
+
+    @model_validator(mode="after")
+    def validate_paths_total(self) -> TriageAsset:
+        included = len(self.paths)
+        if self.paths_total < included:
+            raise ValueError("paths_total não pode ser menor que paths")
+        if self.paths_total <= 50 and self.paths_total != included:
+            raise ValueError("paths_total deve corresponder aos paths incluídos")
+        if self.paths_total > 50 and included != 50:
+            raise ValueError("assets truncados devem conter exatamente 50 paths")
+        return self
 
 
 class _TriageItems(TriageSchema):

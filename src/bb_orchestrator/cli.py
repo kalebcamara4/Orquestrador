@@ -756,7 +756,7 @@ def triage(
         ),
     ] = DEFAULT_TRIAGE_BATCH_SIZE,
 ) -> None:
-    """Prepara lotes determinísticos para triagem futura por LLM."""
+    """Prepara lotes locais de superfície para futura análise humana ou por LLM."""
     if not dry_run:
         _abort("triage está disponível somente com --dry-run nesta etapa")
 
@@ -772,7 +772,8 @@ def triage(
         except InputError as exc:
             _abort(str(exc))
     typer.echo(
-        f"Run {run_id}: itens={result.item_count}, lotes={result.batch_count}; "
+        f"Run {run_id}: assets={result.item_count}, paths incluídos={result.included_paths}, "
+        f"paths omitidos={result.omitted_paths}, lotes={result.batch_count}; "
         f"arquivos em {program.runs_path}/{run_id}/llm/."
     )
 

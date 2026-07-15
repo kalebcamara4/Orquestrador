@@ -475,7 +475,7 @@ referências na fila. A operação é idempotente e a fila não contém payload 
 bb queue list
 ```
 
-### 7. Prepare a triagem em modo local
+### 7. Prepare a triagem de superfície sanitizada em modo local
 
 Somente itens pendentes associados a assets sanitizados e a candidatos aprovados entram nos lotes:
 
@@ -508,7 +508,13 @@ Os arquivos são gravados em
 
 Executar novamente a triagem da mesma run recria os mesmos lotes deterministicamente e substitui
 os arquivos `triage-input-*.json` daquele diretório. Nesta etapa, triage não consome a fila e não
-altera `pending`: ela apenas prepara arquivos locais para a futura integração com LLM.
+altera candidatos, verificações HTTP, paths, assets, queue items ou snapshots: ela apenas prepara
+arquivos locais para futura análise humana ou por LLM.
+
+A fonte de verdade é exclusivamente o SQLite do programa ativo. Para cada asset elegível, a
+preparação usa o último status HTTP, título e tecnologias já sanitizados e os registros da tabela
+`crawl_paths` da mesma run e host. O arquivo `crawl/paths.jsonl` nunca é lido pela triagem; ele
+continua sendo somente um artefato de exportação.
 
 Cada item possui um `asset_id` derivado deterministicamente do host canônico e contém somente a
 allowlist abaixo:
@@ -517,16 +523,26 @@ allowlist abaixo:
 {
   "asset_id": "asset-<sha256>",
   "host": "api.example.com",
-  "status": null,
-  "title": null,
-  "technologies": [],
-  "paths": []
+  "status": 200,
+  "title": "Safe Title",
+  "technologies": ["nginx", "React"],
+  "paths": ["/", "/api/v1/users", "/login"],
+  "paths_total": 3
 }
 ```
 
+Os paths são normalizados, deduplicados e ordenados. Cada item inclui no máximo os primeiros 50;
+`paths_total` informa o total seguro persistido para o asset. Assim, quando `paths_total` for 60,
+o lote terá 50 paths e a CLI contará 10 como omitidos pelo limite de contexto. Assets sem crawl
+mantêm `paths: []` e `paths_total: 0`.
+
 O JSON final passa por um policy gate default-deny antes da gravação. Campos extras, URLs, query
-strings, IPs, portas, headers, corpo HTTP, cookies, tokens, chaves e PII fazem a preparação falhar.
-Uma run inexistente ou sem itens sanitizados e pendentes também falha sem criar lotes.
+strings, fragmentos, hosts, IPs, portas, credenciais, headers, corpo HTTP, cookies, tokens, chaves,
+e-mails, telefones, controles e PII fazem a preparação inteira falhar antes de qualquer lote ser
+gravado. Uma run inexistente ou sem itens sanitizados e pendentes também falha sem criar lotes.
+
+Paths são evidências de superfície pública observada. Eles não representam vulnerabilidades, não
+confirmam autorização ou acesso a conteúdo e não constituem PoC.
 
 O schema estrito reservado para uma futura resposta é:
 
@@ -546,7 +562,8 @@ O schema estrito reservado para uma futura resposta é:
 ```
 
 Nesta etapa, `triage` exige explicitamente `--dry-run`. Ele apenas lê o SQLite e grava arquivos
-locais; não importa clientes HTTP, LiteLLM ou Ollama e não envia requisições.
+locais. Não existe cliente de LLM, LiteLLM, Ollama, LM Studio, API externa, subprocesso, tráfego de
+rede ou transmissão de dados.
 
 ## Bancos locais isolados
 
