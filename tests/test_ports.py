@@ -153,7 +153,7 @@ def test_ports_dry_run_has_no_adapter_files_or_network(monkeypatch) -> None:
 
     assert result.exit_code == 0, result.output
     assert "Política: conservative" in result.output
-    assert "Versão da política: 1" in result.output
+    assert "Versão da política: 2" in result.output
     assert "workers=2; pacotes/s=4; timeout=1000ms; retries=0" in result.output
     assert "portas=80,443,8080,8443; tipo=tcp_connect" in result.output
     assert "-scan-type c" in result.output

@@ -1,4 +1,4 @@
-"""Casos de uso seguros, sem requests aos hosts descobertos."""
+"""Casos de uso locais e execuções externas explicitamente limitadas."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -15,6 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from pydantic import ValidationError
 from sqlalchemy import and_, func, select
@@ -31,6 +33,7 @@ from bb_orchestrator.domain import (
 from bb_orchestrator.models import (
     AssetModel,
     CandidateModel,
+    CrawlPathModel,
     DnsVerificationAttemptModel,
     HttpVerificationAttemptModel,
     PortObservationModel,
@@ -42,6 +45,7 @@ from bb_orchestrator.policies import (
     DnsParameters,
     ExecutionPolicy,
     HttpParameters,
+    KatanaParameters,
     PolicyError,
     PortParameters,
     get_program_policy,
@@ -70,6 +74,8 @@ SUBFINDER_TIMEOUT_SECONDS = 300
 HTTP_TITLE_MAX_LENGTH = 200
 HTTP_TECHNOLOGY_MAX_LENGTH = 80
 HTTP_TECHNOLOGIES_MAX_COUNT = 20
+KATANA_HELP_TIMEOUT_SECONDS = 10
+KATANA_HELP_MAX_BYTES = 256 * 1024
 
 _HTTPX_BLOCKED_ENVIRONMENT = frozenset(
     {
@@ -114,6 +120,39 @@ _NAABU_BLOCKED_ENVIRONMENT = frozenset(
         "HTTP_PROXY",
         "HTTPS_PROXY",
         "NO_PROXY",
+    }
+)
+
+_KATANA_BLOCKED_ENVIRONMENT = frozenset(
+    {
+        "ALL_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+    }
+)
+_PATH_HOSTNAME_PATTERN = re.compile(
+    r"(?i)(?<![a-z0-9-])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z]{2,63}(?![a-z0-9-])"
+)
+_PATH_FILE_EXTENSIONS = frozenset(
+    {
+        "css",
+        "gif",
+        "htm",
+        "html",
+        "ico",
+        "jpeg",
+        "jpg",
+        "js",
+        "json",
+        "map",
+        "pdf",
+        "png",
+        "svg",
+        "txt",
+        "webp",
+        "xml",
     }
 )
 
@@ -233,6 +272,25 @@ class PortVerificationResult:
 
 
 @dataclass(frozen=True)
+class KatanaCrawlPlan:
+    host_count: int
+    skipped_without_scheme: int
+    command: tuple[str, ...]
+    output_path: Path
+    policy_name: str
+    policy_version: str
+    parameters: KatanaParameters
+
+
+@dataclass(frozen=True)
+class KatanaCrawlResult:
+    attempted: int
+    observed_paths: int
+    skipped_without_scheme: int
+    output_path: Path
+
+
+@dataclass(frozen=True)
 class SurfaceExportResult:
     exported: int
     path: Path
@@ -246,9 +304,22 @@ class OpenPort:
 
 
 @dataclass(frozen=True)
+class CrawlPath:
+    host: str
+    path: str
+    source: str
+
+
+@dataclass(frozen=True)
 class _ParsedOpenPort:
     host: str
     port: int
+
+
+@dataclass(frozen=True)
+class _KatanaTarget:
+    host: str
+    scheme: str
 
 
 @dataclass(frozen=True)
@@ -264,6 +335,7 @@ class AssetDnsState:
 class _HttpObservation:
     reachability: str
     status_code: int | None
+    scheme: str | None
     title: str | None
     technologies: list[str] | None
 
@@ -1092,6 +1164,7 @@ def _http_observations(stdout: str, allowed_hosts: set[str]) -> dict[str, _HttpO
         host: _HttpObservation(
             reachability=HttpReachability.UNREACHABLE.value,
             status_code=None,
+            scheme=None,
             title=None,
             technologies=None,
         )
@@ -1118,13 +1191,41 @@ def _http_observations(stdout: str, allowed_hosts: set[str]) -> dict[str, _HttpO
             or observations[host].reachability == HttpReachability.REACHABLE.value
         ):
             continue
+        scheme = _sanitize_http_scheme(payload.get("url"), expected_host=host)
         observations[host] = _HttpObservation(
             reachability=HttpReachability.REACHABLE.value,
             status_code=status_code,
+            scheme=scheme,
             title=_sanitize_http_text(payload.get("title"), max_length=HTTP_TITLE_MAX_LENGTH),
             technologies=_sanitize_http_technologies(payload.get("tech")),
         )
     return observations
+
+
+def _sanitize_http_scheme(value: Any, *, expected_host: str) -> str | None:
+    """Reduz a URL não confiável do httpx ao esquema usado, sem persistir a URL."""
+    if not isinstance(value, str) or len(value) > 4096:
+        return None
+    if any(unicodedata.category(character).startswith("C") for character in value):
+        return None
+    try:
+        parsed = urlsplit(value)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        _ = parsed.port
+    except (ValueError, TypeError):
+        return None
+    if scheme not in {"http", "https"} or hostname is None:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    try:
+        normalized_host = normalize_domain(hostname)
+    except (InvalidDomain, TypeError, ValueError):
+        return None
+    if normalized_host != expected_host:
+        return None
+    return scheme
 
 
 def _httpx_environment() -> dict[str, str]:
@@ -1172,6 +1273,7 @@ def verify_http(
             host=candidate.host,
             reachability=HttpReachability.PENDING.value,
             status_code=None,
+            scheme=None,
             title=None,
             technologies=None,
             verified_at=started_at,
@@ -1221,6 +1323,7 @@ def verify_http(
         observation = observations[attempt.host]
         attempt.reachability = observation.reachability
         attempt.status_code = observation.status_code
+        attempt.scheme = observation.scheme
         attempt.title = observation.title
         attempt.technologies = observation.technologies
         attempt.verified_at = checked_at
@@ -1601,15 +1704,396 @@ def list_open_ports(run_id: int, session: Session) -> list[OpenPort]:
     ]
 
 
+def _eligible_katana_targets(
+    run_id: int,
+    session: Session,
+    *,
+    program_slug: str,
+) -> tuple[list[_KatanaTarget], int]:
+    _require_run(run_id, session)
+    patterns = _scope_patterns(session)
+    latest_dns = _latest_dns_attempts(run_id, session, program_slug=program_slug)
+    latest_http = _latest_http_attempts(run_id, session, program_slug=program_slug)
+    candidates = list(
+        session.scalars(
+            select(CandidateModel)
+            .where(
+                CandidateModel.run_id == run_id,
+                CandidateModel.status == CandidateStatus.APPROVED.value,
+            )
+            .order_by(CandidateModel.host, CandidateModel.id)
+        )
+    )
+
+    reachable: list[tuple[CandidateModel, HttpVerificationAttemptModel]] = []
+    for candidate in candidates:
+        dns_attempt = latest_dns.get(candidate.id)
+        http_attempt = latest_http.get(candidate.id)
+        if (
+            _is_safely_in_scope(candidate.host, patterns)
+            and dns_attempt is not None
+            and dns_attempt.host == candidate.host
+            and dns_attempt.status == DnsStatus.RESOLVED.value
+            and http_attempt is not None
+            and http_attempt.host == candidate.host
+            and http_attempt.reachability == HttpReachability.REACHABLE.value
+        ):
+            reachable.append((candidate, http_attempt))
+
+    if not reachable:
+        raise InputError(
+            f"run {run_id} não possui candidatos approved, DNS resolved e HTTP reachable"
+        )
+
+    targets = [
+        _KatanaTarget(host=candidate.host, scheme=http_attempt.scheme)
+        for candidate, http_attempt in reachable
+        if http_attempt.scheme in {"http", "https"}
+    ]
+    skipped = len(reachable) - len(targets)
+    if not targets:
+        raise InputError(
+            "hosts HTTP reachable não possuem esquema sanitizado; "
+            f"execute bb verify http {run_id} --confirm e tente novamente"
+        )
+    return targets, skipped
+
+
+def _katana_command(seed: str, parameters: KatanaParameters) -> tuple[str, ...]:
+    return (
+        "katana",
+        "-u",
+        seed,
+        "-d",
+        str(parameters.depth),
+        "-c",
+        str(parameters.concurrency),
+        "-p",
+        str(parameters.parallelism),
+        "-rl",
+        str(parameters.rate_limit_per_second),
+        "-timeout",
+        str(parameters.timeout_seconds),
+        "-retry",
+        str(parameters.retries),
+        "-ct",
+        f"{parameters.max_duration_seconds}s",
+        "-mrs",
+        str(parameters.max_response_read_bytes),
+        "-fs",
+        parameters.scope,
+        "-f",
+        parameters.output_field,
+        "-silent",
+        "-nc",
+        "-dr",
+        "-config",
+        "/dev/null",
+        "-duc",
+    )
+
+
+def _katana_crawl_plan(
+    run_id: int,
+    targets: Sequence[_KatanaTarget],
+    skipped_without_scheme: int,
+    runs_path: Path,
+    policy: ExecutionPolicy,
+) -> KatanaCrawlPlan:
+    parameters = policy.katana
+    return KatanaCrawlPlan(
+        host_count=len(targets),
+        skipped_without_scheme=skipped_without_scheme,
+        command=_katana_command("<scheme>://<host>/", parameters),
+        output_path=runs_path / str(run_id) / "crawl" / "paths.jsonl",
+        policy_name=policy.name.value,
+        policy_version=policy.version,
+        parameters=parameters,
+    )
+
+
+def plan_katana_crawl(
+    run_id: int,
+    session: Session,
+    *,
+    program_slug: str,
+    runs_path: Path = DEFAULT_RUNS_PATH,
+) -> KatanaCrawlPlan:
+    """Planeja o Katana sem consultar PATH, criar arquivos, executar processo ou usar rede."""
+    targets, skipped = _eligible_katana_targets(
+        run_id,
+        session,
+        program_slug=program_slug,
+    )
+    try:
+        policy = get_program_policy(session, program_slug=program_slug)
+    except PolicyError as exc:
+        raise InputError(str(exc)) from exc
+    return _katana_crawl_plan(run_id, targets, skipped, runs_path, policy)
+
+
+def _katana_environment() -> dict[str, str]:
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if name.upper() not in _KATANA_BLOCKED_ENVIRONMENT
+        and name.upper() != "ENABLE_CLOUD_UPLOAD"
+        and not name.upper().startswith(("KATANA_", "PDCP_"))
+    }
+
+
+def _validate_katana_help(
+    executable: str,
+    adapter: SubprocessAdapter,
+    *,
+    environment: dict[str, str],
+    command: Sequence[str],
+) -> None:
+    try:
+        completed = adapter.run(
+            (executable, "-h"),
+            timeout_seconds=KATANA_HELP_TIMEOUT_SECONDS,
+            environment=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise InputError("não foi possível validar a sintaxe do katana instalado") from exc
+    if completed.returncode != 0:
+        raise InputError(
+            _safe_subprocess_error(
+                completed.stderr or "",
+                tool="katana -h",
+                returncode=completed.returncode,
+            )
+        )
+
+    help_text = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+    if len(help_text.encode("utf-8", errors="replace")) > KATANA_HELP_MAX_BYTES:
+        raise InputError("a ajuda do katana excedeu o limite seguro")
+    available_flags = set(
+        re.findall(r"(?<![a-z0-9-])(--?[a-z][a-z0-9-]*)(?=[,\s])", help_text.lower())
+    )
+    required_flags = {argument for argument in command if argument.startswith("-")}
+    missing = sorted(required_flags - available_flags)
+    if missing:
+        raise InputError(
+            "a versão instalada do katana não reconhece a sintaxe segura exigida "
+            f"({', '.join(missing)}); instale manualmente uma versão compatível"
+        )
+
+
+def _sanitize_crawl_path(value: str) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > 512:
+        return None
+    if any(unicodedata.category(character).startswith("C") for character in value):
+        return None
+    try:
+        decoded = unicodedata.normalize("NFC", unquote(value, errors="strict"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if any(unicodedata.category(character).startswith("C") for character in decoded):
+        return None
+
+    query_index = decoded.find("?")
+    fragment_index = decoded.find("#")
+    cut_indexes = [index for index in (query_index, fragment_index) if index >= 0]
+    without_query = decoded[: min(cut_indexes)] if cut_indexes else decoded
+    if (
+        not without_query.startswith("/")
+        or without_query.startswith("//")
+        or "\\" in without_query
+        or "@" in without_query
+    ):
+        return None
+
+    normalized = posixpath.normpath(without_query)
+    if not normalized.startswith("/") or normalized.startswith("//") or len(normalized) > 512:
+        return None
+    if _contains_hostname_path(normalized) or _forbidden_reason(normalized) is not None:
+        return None
+    return normalized
+
+
+def _contains_hostname_path(path: str) -> bool:
+    segments = [segment for segment in path.split("/") if segment]
+    for index, segment in enumerate(segments):
+        if _PATH_HOSTNAME_PATTERN.fullmatch(segment) is None:
+            continue
+        extension = segment.rpartition(".")[2].lower()
+        if index == len(segments) - 1 and extension in _PATH_FILE_EXTENSIONS:
+            continue
+        return True
+    return False
+
+
+def _sanitize_katana_output(stdout: str, *, max_paths: int) -> list[str]:
+    paths: set[str] = set()
+    for raw_line in stdout.split("\n"):
+        path = _sanitize_crawl_path(raw_line)
+        if path is None:
+            continue
+        paths.add(path)
+        if len(paths) > max_paths:
+            paths.remove(max(paths))
+    return sorted(paths)
+
+
+def _crawl_paths_jsonl_content(run_id: int, session: Session) -> str:
+    records = session.scalars(
+        select(CrawlPathModel)
+        .where(CrawlPathModel.run_id == run_id)
+        .order_by(CrawlPathModel.host, CrawlPathModel.path, CrawlPathModel.source)
+    )
+    return "".join(
+        json.dumps(
+            {"host": record.host, "path": record.path, "source": record.source},
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+        for record in records
+    )
+
+
+def crawl_with_katana(
+    run_id: int,
+    session: Session,
+    *,
+    program_slug: str,
+    runs_path: Path = DEFAULT_RUNS_PATH,
+    adapter: SubprocessAdapter | None = None,
+) -> KatanaCrawlResult:
+    """Executa um Katana por host e retém somente paths relativos sanitizados."""
+    adapter = adapter or DEFAULT_SUBPROCESS_ADAPTER
+    targets, skipped = _eligible_katana_targets(
+        run_id,
+        session,
+        program_slug=program_slug,
+    )
+    try:
+        policy = get_program_policy(session, program_slug=program_slug)
+    except PolicyError as exc:
+        raise InputError(str(exc)) from exc
+    plan = _katana_crawl_plan(run_id, targets, skipped, runs_path, policy)
+
+    executable = adapter.find_executable("katana")
+    if executable is None:
+        raise InputError(
+            "katana não está instalado; instale-o manualmente e adicione o binário ao PATH"
+        )
+    environment = _katana_environment()
+    _validate_katana_help(
+        executable,
+        adapter,
+        environment=environment,
+        command=plan.command,
+    )
+
+    paths_by_host: dict[str, list[str]] = {}
+    for target in targets:
+        seed = f"{target.scheme}://{target.host}/"
+        planned_command = _katana_command(seed, plan.parameters)
+        command = (executable, *planned_command[1:])
+        try:
+            completed = adapter.run(
+                command,
+                timeout_seconds=plan.parameters.max_duration_seconds,
+                environment=environment,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise InputError(f"não foi possível executar o katana para {target.host}") from exc
+        if completed.returncode != 0:
+            raise InputError(
+                _safe_subprocess_error(
+                    completed.stderr or "",
+                    tool="katana",
+                    returncode=completed.returncode,
+                )
+            )
+        paths_by_host[target.host] = _sanitize_katana_output(
+            completed.stdout or "",
+            max_paths=plan.parameters.max_paths_per_host,
+        )
+
+    try:
+        snapshot = persist_policy_snapshot(
+            session,
+            run_id=run_id,
+            program_slug=program_slug,
+            step="katana",
+            policy=policy,
+        )
+    except PolicyError as exc:
+        session.rollback()
+        raise InputError(str(exc)) from exc
+    session.flush()
+
+    observed_at = datetime.now(UTC)
+    existing_by_host: dict[str, set[str]] = {}
+    for record in session.scalars(select(CrawlPathModel).where(CrawlPathModel.run_id == run_id)):
+        existing_by_host.setdefault(record.host, set()).add(record.path)
+
+    observed_paths = 0
+    for target in targets:
+        existing = existing_by_host.setdefault(target.host, set())
+        for path in paths_by_host[target.host]:
+            observed_paths += 1
+            if path in existing or len(existing) >= plan.parameters.max_paths_per_host:
+                continue
+            session.add(
+                CrawlPathModel(
+                    run_id=run_id,
+                    host=target.host,
+                    path=path,
+                    source="katana",
+                    observed_at=observed_at,
+                    policy_snapshot_id=snapshot.id,
+                )
+            )
+            existing.add(path)
+    session.flush()
+    try:
+        _write_atomic(
+            plan.output_path,
+            _crawl_paths_jsonl_content(run_id, session),
+            "crawl/paths.jsonl",
+        )
+    except InputError:
+        session.rollback()
+        raise
+    session.commit()
+    return KatanaCrawlResult(
+        attempted=len(targets),
+        observed_paths=observed_paths,
+        skipped_without_scheme=skipped,
+        output_path=plan.output_path,
+    )
+
+
+def list_crawl_paths(run_id: int, session: Session) -> list[CrawlPath]:
+    _require_run(run_id, session)
+    return [
+        CrawlPath(host=record.host, path=record.path, source=record.source)
+        for record in session.scalars(
+            select(CrawlPathModel)
+            .where(CrawlPathModel.run_id == run_id)
+            .order_by(CrawlPathModel.host, CrawlPathModel.path, CrawlPathModel.source)
+        )
+    ]
+
+
 def _surface_stage(
     dns_status: str,
     http_reachability: str,
     open_ports: tuple[int, ...],
+    path_count: int,
 ) -> SurfaceStage:
     if dns_status != DnsStatus.RESOLVED.value:
         return SurfaceStage.PENDING
     if http_reachability != HttpReachability.REACHABLE.value:
         return SurfaceStage.DNS_RESOLVED
+    if path_count:
+        return SurfaceStage.PATHS_OBSERVED
     if open_ports:
         return SurfaceStage.PORTS_OBSERVED
     return SurfaceStage.HTTP_REACHABLE
@@ -1644,6 +2128,15 @@ def build_surface_map(
     ):
         if observation.host in candidate_hosts:
             ports_by_host.setdefault(observation.host, set()).add(observation.port)
+    path_counts = {
+        host: min(count, 100)
+        for host, count in session.execute(
+            select(CrawlPathModel.host, func.count(CrawlPathModel.id))
+            .where(CrawlPathModel.run_id == run_id)
+            .group_by(CrawlPathModel.host)
+        )
+        if host in candidate_hosts
+    }
 
     surface: list[SurfaceRecord] = []
     for candidate in candidates:
@@ -1653,6 +2146,7 @@ def build_surface_map(
         title: str | None = None
         technologies: tuple[str, ...] = ()
         open_ports: tuple[int, ...] = ()
+        path_count = 0
 
         if candidate.status == CandidateStatus.APPROVED.value:
             dns_attempt = latest_dns.get(candidate.id)
@@ -1679,6 +2173,7 @@ def build_surface_map(
                     sanitized_technologies = _sanitize_http_technologies(http_attempt.technologies)
                     technologies = tuple(sanitized_technologies or ())
                     open_ports = tuple(sorted(ports_by_host.get(candidate.host, set())))
+                    path_count = path_counts.get(candidate.host, 0)
 
         surface.append(
             SurfaceRecord(
@@ -1690,7 +2185,13 @@ def build_surface_map(
                 http_title=title,
                 http_technologies=technologies,
                 open_ports=open_ports,
-                stage=_surface_stage(dns_status, http_reachability, open_ports),
+                path_count=path_count,
+                stage=_surface_stage(
+                    dns_status,
+                    http_reachability,
+                    open_ports,
+                    path_count,
+                ),
             )
         )
     return surface

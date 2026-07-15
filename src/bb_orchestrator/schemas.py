@@ -61,6 +61,7 @@ class SurfaceStage(StrEnum):
     DNS_RESOLVED = "dns_resolved"
     HTTP_REACHABLE = "http_reachable"
     PORTS_OBSERVED = "ports_observed"
+    PATHS_OBSERVED = "paths_observed"
 
 
 class Schema(BaseModel):
@@ -145,6 +146,7 @@ class SurfaceRecord(Schema):
         max_length=20,
     )
     open_ports: tuple[StrictInt, ...] = Field(default_factory=tuple)
+    path_count: StrictInt = Field(default=0, ge=0, le=100)
     stage: SurfaceStage
 
     @field_validator("host")

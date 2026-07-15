@@ -53,12 +53,31 @@ class PortParameters(_PolicyModel):
     process_timeout_seconds: int = Field(ge=1)
 
 
+class KatanaParameters(_PolicyModel):
+    mode: Literal["standard"]
+    headless: Literal[False]
+    javascript: Literal[False]
+    concurrency: int = Field(ge=1)
+    parallelism: int = Field(ge=1)
+    rate_limit_per_second: int = Field(ge=1)
+    depth: int = Field(ge=1)
+    timeout_seconds: int = Field(ge=1)
+    retries: int = Field(ge=0)
+    max_duration_seconds: int = Field(ge=1)
+    max_response_read_bytes: int = Field(ge=1)
+    max_paths_per_host: int = Field(ge=1)
+    scope: Literal["fqdn"]
+    output_field: Literal["path"]
+    methods: tuple[Literal["GET"]]
+
+
 class ExecutionPolicy(_PolicyModel):
     name: PolicyName
     version: str = Field(pattern=r"^[1-9][0-9]*(?:\.[0-9]+)*$")
     dns: DnsParameters
     http: HttpParameters
     ports: PortParameters
+    katana: KatanaParameters
 
 
 class PolicySnapshot(_PolicyModel):
@@ -69,7 +88,7 @@ class PolicySnapshot(_PolicyModel):
 
 CONSERVATIVE_POLICY = ExecutionPolicy(
     name=PolicyName.CONSERVATIVE,
-    version="1",
+    version="2",
     dns=DnsParameters(
         threads=5,
         rate_limit_per_second=5,
@@ -90,6 +109,23 @@ CONSERVATIVE_POLICY = ExecutionPolicy(
         ports=(80, 443, 8080, 8443),
         scan_type="tcp_connect",
         process_timeout_seconds=300,
+    ),
+    katana=KatanaParameters(
+        mode="standard",
+        headless=False,
+        javascript=False,
+        concurrency=1,
+        parallelism=1,
+        rate_limit_per_second=1,
+        depth=1,
+        timeout_seconds=10,
+        retries=0,
+        max_duration_seconds=60,
+        max_response_read_bytes=1024 * 1024,
+        max_paths_per_host=100,
+        scope="fqdn",
+        output_field="path",
+        methods=("GET",),
     ),
 )
 
@@ -141,7 +177,7 @@ def set_program_policy(
 
 def policy_snapshot(
     policy: ExecutionPolicy,
-    step: Literal["dns", "http", "ports"],
+    step: Literal["dns", "http", "ports", "katana"],
 ) -> PolicySnapshot:
     parameters = getattr(policy, step)
     return PolicySnapshot(
@@ -156,7 +192,7 @@ def persist_policy_snapshot(
     *,
     run_id: int,
     program_slug: str,
-    step: Literal["dns", "http", "ports"],
+    step: Literal["dns", "http", "ports", "katana"],
     policy: ExecutionPolicy,
 ) -> ExecutionPolicySnapshotModel:
     if session.get(RunModel, run_id) is None:

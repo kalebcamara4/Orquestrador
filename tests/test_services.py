@@ -35,6 +35,7 @@ def test_database_contains_the_corresponding_tables(tmp_path: Path) -> None:
     assert set(inspect(engine).get_table_names()) == {
         "assets",
         "candidates",
+        "crawl_paths",
         "dns_verification_attempts",
         "execution_policy_snapshots",
         "http_verification_attempts",
@@ -94,9 +95,27 @@ def test_http_attempts_table_has_only_minimal_results_and_relations(tmp_path: Pa
         "host",
         "reachability",
         "status_code",
+        "scheme",
         "title",
         "technologies",
         "verified_at",
+    }
+
+
+def test_crawl_paths_table_has_only_reduced_results_and_policy_reference(
+    tmp_path: Path,
+) -> None:
+    engine = create_sqlite_engine(tmp_path / "crawl-columns.db")
+    initialize_database(engine)
+
+    assert {column["name"] for column in inspect(engine).get_columns("crawl_paths")} == {
+        "id",
+        "run_id",
+        "host",
+        "path",
+        "source",
+        "observed_at",
+        "policy_snapshot_id",
     }
 
 

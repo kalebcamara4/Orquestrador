@@ -122,6 +122,10 @@ class HttpVerificationAttemptModel(Base):
             "status_code IS NULL OR status_code BETWEEN 100 AND 599",
             name="ck_http_verification_status_code",
         ),
+        CheckConstraint(
+            "scheme IS NULL OR scheme IN ('http', 'https')",
+            name="ck_http_verification_scheme",
+        ),
         Index("ix_http_attempt_candidate_latest", "candidate_id", "id"),
     )
 
@@ -136,6 +140,7 @@ class HttpVerificationAttemptModel(Base):
     host: Mapped[str] = mapped_column(String(253), nullable=False)
     reachability: Mapped[str] = mapped_column(String(16), nullable=False)
     status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    scheme: Mapped[str | None] = mapped_column(String(5), nullable=True)
     title: Mapped[str | None] = mapped_column(String(200), nullable=True)
     technologies: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     verified_at: Mapped[datetime] = mapped_column(nullable=False)
@@ -144,7 +149,10 @@ class HttpVerificationAttemptModel(Base):
 class ExecutionPolicySnapshotModel(Base):
     __tablename__ = "execution_policy_snapshots"
     __table_args__ = (
-        CheckConstraint("step IN ('dns', 'http', 'ports')", name="ck_policy_snapshot_step"),
+        CheckConstraint(
+            "step IN ('dns', 'http', 'ports', 'katana')",
+            name="ck_policy_snapshot_step",
+        ),
         Index("ix_policy_snapshot_run_step", "run_id", "step", "id"),
     )
 
@@ -173,6 +181,29 @@ class PortObservationModel(Base):
     status: Mapped[str] = mapped_column(String(8), nullable=False)
     observed_at: Mapped[datetime] = mapped_column(nullable=False)
     tool_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy_snapshot_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_policy_snapshots.id"), nullable=False, index=True
+    )
+
+
+class CrawlPathModel(Base):
+    __tablename__ = "crawl_paths"
+    __table_args__ = (
+        CheckConstraint("source = 'katana'", name="ck_crawl_path_source"),
+        CheckConstraint(
+            "length(path) BETWEEN 1 AND 512 AND substr(path, 1, 1) = '/'",
+            name="ck_crawl_path_relative_length",
+        ),
+        UniqueConstraint("run_id", "host", "path", name="uq_crawl_path_run_host_path"),
+        Index("ix_crawl_path_run_host", "run_id", "host"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("runs.id"), nullable=False, index=True)
+    host: Mapped[str] = mapped_column(String(253), nullable=False)
+    path: Mapped[str] = mapped_column(String(512), nullable=False)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(nullable=False)
     policy_snapshot_id: Mapped[int] = mapped_column(
         ForeignKey("execution_policy_snapshots.id"), nullable=False, index=True
     )

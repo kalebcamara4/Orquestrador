@@ -3,8 +3,9 @@
 CLI local para organizar ativos de programas de bug bounty **explicitamente autorizados**.
 O fluxo começa com descoberta passiva e aprovação humana obrigatória. Depois da aprovação,
 ele permite três verificações ativas mínimas: resolução DNS com `dnsx`, consulta HTTP raiz com
-`httpx` e quatro portas TCP fixas com `naabu`. Não há crawling, fuzzing, nuclei ou integração com
-modelos de linguagem.
+`httpx` e quatro portas TCP fixas com `naabu`. Depois do mapa local, o Katana pode descobrir paths
+públicos com profundidade 1, sem autenticação, JavaScript ou headless. Não há fuzzing, nuclei ou
+integração com modelos de linguagem.
 Depois dessas verificações, um mapa local consolida os estados já persistidos sem gerar tráfego
 adicional.
 
@@ -18,6 +19,8 @@ adicional.
   `verify http <run-id> --confirm`)
 - ProjectDiscovery `naabu` no `PATH` (opcional; necessário somente para
   `verify ports <run-id> --confirm`)
+- ProjectDiscovery `katana` no `PATH` (opcional; necessário somente para
+  `crawl katana <run-id> --confirm`)
 - VS Code (opcional)
 
 ## Instalação
@@ -78,8 +81,8 @@ bb program select
 
 Arquivar retira o programa do seletor e limpa a seleção se ele estiver ativo, mas nunca apaga seu
 banco nem seus artefatos. Sem programa ativo, comandos como `scope`, `recon`, `run`, `candidates`,
-`policy`, `verify`, `ports`, `surface`, `assets`, `sanitize`, `queue` e `triage` recusam a operação
-com:
+`policy`, `verify`, `ports`, `surface`, `crawl`, `paths`, `assets`, `sanitize`, `queue` e `triage`
+recusam a operação com:
 
 ```text
 Nenhum programa selecionado. Execute: bb program select
@@ -94,6 +97,7 @@ O fluxo seguro é:
 scope import → recon passivo → candidatos em escopo → aprovação humana
              → verificação DNS → verificação HTTP → verificação de portas
              → mapa local da superfície
+             → descoberta pública de paths → mapa local atualizado
              → assets list/export
              → sanitize → fila → triage --dry-run
 ```
@@ -111,7 +115,10 @@ bb policy set conservative
 
 DNS mantém 5 threads e 5 consultas/s. HTTP usa 2 threads, 2 req/s, timeout de 10 segundos e zero
 retries. Portas usa 2 workers, 4 pacotes/s, timeout de 1000 ms, zero retries, TCP CONNECT e somente
-`80,443,8080,8443`. Todo dry-run de verificação mostra nome, versão e parâmetros efetivos. Cada
+`80,443,8080,8443`. Katana usa modo padrão sem headless ou JavaScript, um processo por host,
+concorrência e paralelismo 1, 1 req/s, depth 1, timeout de 10 segundos, zero retry, duração máxima
+de 60 segundos, leitura máxima de 1 MiB por resposta e até 100 paths por host. Todo dry-run de
+verificação mostra nome, versão e parâmetros efetivos. Cada
 confirmação cria no SQLite um snapshot independente com somente nome, versão e parâmetros da
 etapa; atualizações futuras da definição não reescrevem o histórico.
 
@@ -280,7 +287,8 @@ crawling ou adicionar outros paths. Respostas 200, redirects, 401, 403 e 404 sã
 ausência de uma resposta HTTP válida é `unreachable`.
 
 O JSONL bruto do `httpx` nunca é salvo. Ele é processado somente em memória e reduzido a host,
-status code, reachability e, opcionalmente, título e tecnologias. Títulos têm limite de 200
+status code, reachability, ao esquema `http|https` usado e, opcionalmente, título e tecnologias.
+Nenhuma URL é persistida. Títulos têm limite de 200
 caracteres; tecnologias têm até 20 itens de 80 caracteres. Caracteres de controle são removidos.
 Campos com URL, IP, porta, token, e-mail, telefone ou outro padrão proibido são descartados por um
 gate default-deny. Headers, cookies, body, resposta raw, query strings e redirect location nunca
@@ -296,6 +304,8 @@ Cada confirmação cria uma nova tentativa HTTP por host e preserva o histórico
 mostra os últimos estados DNS e HTTP e o status code; hosts ainda não verificados aparecem como
 HTTP `pending` e status `-`. A etapa continua sem alterar `assets export`, `sanitize` ou `triage`.
 Se `httpx` não estiver no `PATH`, a CLI pede instalação manual e não instala nada.
+Tentativas criadas por versões antigas podem não ter esquema; elas continuam válidas no histórico,
+mas o host só fica elegível ao crawler depois de repetir `bb verify http 1 --confirm`.
 
 ### 3C. Verifique quatro portas TCP com Naabu
 
@@ -340,7 +350,8 @@ bb surface export 1
 ```
 
 `surface list` mostra, em ordem de hostname, aprovação, último DNS, último HTTP, status code,
-título e tecnologias HTTP sanitizados, portas abertas ordenadas e um estágio objetivo. Candidatos
+título e tecnologias HTTP sanitizados, portas abertas ordenadas, quantidade de paths e um estágio
+objetivo. Candidatos
 `pending` e `rejected` continuam visíveis, mas seus dados de verificações ficam ocultos. Para os
 aprovados, HTTP só é mostrado quando o último DNS está `resolved`; portas só são mostradas quando
 o último HTTP está `reachable`.
@@ -350,8 +361,9 @@ exploração:
 
 - sem DNS `resolved`: `pending`;
 - DNS `resolved` e HTTP `pending|unreachable`: `dns_resolved`;
-- HTTP `reachable` sem portas registradas: `http_reachable`;
-- HTTP `reachable` com ao menos uma porta aberta registrada: `ports_observed`.
+- HTTP `reachable` sem portas ou paths registrados: `http_reachable`;
+- HTTP `reachable` com ao menos uma porta aberta e sem paths: `ports_observed`;
+- HTTP `reachable` com paths registrados: `paths_observed`.
 
 O export grava atomicamente um único JSONL determinístico e substitui somente esse artefato:
 
@@ -359,10 +371,51 @@ O export grava atomicamente um único JSONL determinístico e substitui somente 
 .bb/programs/<slug>/runs/<run-id>/surface/surface.jsonl
 ```
 
-Cada linha contém os mesmos nove campos seguros da listagem. Valores ausentes usam `null` ou
+Cada linha contém os mesmos dez campos seguros da listagem, incluindo somente `path_count`, nunca
+a lista de paths. Valores ausentes usam `null` ou
 listas vazias no JSONL. IPs, URLs, headers, cookies, body, redirects, banners, versões de
 ferramentas, snapshots de política e dados brutos não são consultados nem exportados. A operação
 não cria assets e não altera candidatos, tentativas, portas, fila ou triage.
+
+### 3E. Descubra paths públicos básicos com Katana
+
+Somente candidatos que continuem `approved`, com últimos estados DNS `resolved` e HTTP
+`reachable`, e cujo HTTP mais recente possua esquema sanitizado, são elegíveis:
+
+```bash
+bb crawl katana 1 --dry-run
+bb crawl katana 1 --confirm
+bb paths list 1
+```
+
+O dry-run consulta apenas o banco local: não procura o binário, não cria arquivo, não inicia
+subprocesso e não usa rede. A confirmação exige Katana já presente no `PATH`, consulta `katana -h`
+para validar as flags suportadas e nunca instala, atualiza ou baixa ferramentas. Cada host roda
+sequencialmente em um processo separado, com seed formado somente em memória como
+`<scheme>://<host>/` e stdin em `DEVNULL`; nenhuma lista de URLs é criada.
+
+O comando limita concorrência e paralelismo a 1, taxa a 1 req/s, depth a 1, timeout a 10 segundos,
+zero retry, duração a 60 segundos e leitura de resposta a 1 MiB. O escopo é o FQDN do seed,
+redirects são desabilitados e a única saída pedida é `path`. Update check e configuração do usuário
+ficam desabilitados. Headless, Chrome, JavaScript crawl, JSluice, XHR, forms, headers, cookies,
+autenticação, proxy, resolvers customizados, known-files, respostas brutas, debug, verbose e métodos
+não GET não são habilitados.
+
+O stdout é processado somente em memória e tratado como não confiável. Apenas paths relativos que
+começam com `/` são considerados; query e fragmento são removidos. URLs, hostnames, IPs, portas,
+credenciais, controles, tokens, e-mails, telefones e valores acima de 512 caracteres são recusados.
+Depois de normalização e deduplicação, no máximo 100 paths por host entram no SQLite. A listagem
+mostra exclusivamente `HOST`, `PATH` e `SOURCE`.
+
+O único artefato da etapa é substituído atomicamente e contém somente `host`, `path` e
+`source="katana"`:
+
+```text
+.bb/programs/<slug>/runs/<run-id>/crawl/paths.jsonl
+```
+
+A etapa cria um snapshot próprio da política e registros em `crawl_paths`, mas não altera
+candidatos, aprovação, DNS, HTTP, portas, assets, fila ou triage.
 
 ### 4. Exporte os assets aprovados
 
@@ -503,7 +556,7 @@ programas. O arquivo `.bb/current-program.json` contém somente o slug atualment
 
 As tabelas incluem `programs`, `program_policies`, `execution_policy_snapshots`, `scope_rules`,
 `runs`, `candidates`, `dns_verification_attempts`, `http_verification_attempts`,
-`port_observations`, `assets` e `queue_items`. Cada banco
+`port_observations`, `crawl_paths`, `assets` e `queue_items`. Cada banco
 armazena apenas os metadados e dados daquele programa: regras, hosts normalizados, fonte, estados,
 timestamps, contadores, referências e hashes SHA-256. O conteúdo bruto e o caminho do JSONL
 manual não são persistidos. As saídas reduzidas e entradas seguras existem somente no diretório
@@ -535,12 +588,14 @@ ruff format .
 
 - Sem LLMs, LiteLLM, DeepSeek ou GPT-OSS.
 - Sem GUI, servidor web ou Docker.
-- A única descoberta automática é o subfinder passivo, após `--confirm`.
+- A descoberta de hosts é somente o subfinder passivo, após `--confirm`.
 - A verificação DNS usa somente dnsx, com 5 threads e 5 DNS/s, após aprovação humana.
 - A verificação HTTP usa somente httpx, com 2 threads, 2 req/s, raiz, timeout de 10 segundos e sem
   redirects, somente após o DNS mais recente estar `resolved`.
 - A verificação de portas usa somente Naabu em TCP CONNECT, nas quatro portas fixas, após HTTP
   `reachable` e sempre com `--confirm`.
 - O mapa da superfície apenas consolida estados locais já persistidos e não gera novo tráfego.
-- Sem ranges/full scan, UDP, SYN/raw socket, Nmap, crawler, ffuf, nuclei ou paths HTTP adicionais.
+- O crawler é somente Katana público, depth 1, sem autenticação, JavaScript ou headless, sempre com
+  `--confirm` e limites fixos.
+- Sem ranges/full scan, UDP, SYN/raw socket, Nmap, ffuf, nuclei ou crawling autenticado.
 - Sem processamento de requisições/respostas HTTP brutas ou segredos.

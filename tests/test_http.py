@@ -348,10 +348,12 @@ def test_http_mocked_results_are_minimal_sanitized_and_reachable_by_response(
     by_host = {attempt.host: attempt for attempt in attempts}
     assert {by_host[host].status_code for host in status_hosts} == {200, 301, 401, 403, 404}
     assert all(by_host[host].reachability == "reachable" for host in status_hosts)
+    assert {by_host[host].scheme for host in status_hosts} == {"https"}
     assert (by_host[down_host].reachability, by_host[down_host].status_code) == (
         "unreachable",
         None,
     )
+    assert by_host[down_host].scheme is None
     assert by_host["ok.example.com"].title == "Safe Title"
     assert by_host["ok.example.com"].technologies == ["nginx", "React"]
     engine = create_sqlite_engine(Path(".bb/programs/test-program/orchestrator.db"))
@@ -362,7 +364,7 @@ def test_http_mocked_results_are_minimal_sanitized_and_reachable_by_response(
     ]
     assert snapshots[0].snapshot == {
         "name": "conservative",
-        "version": "1",
+        "version": "2",
         "parameters": {
             "threads": 2,
             "rate_limit_per_second": 2,

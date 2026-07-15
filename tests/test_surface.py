@@ -292,15 +292,17 @@ def test_surface_list_is_local_latest_sanitized_and_deterministic(monkeypatch) -
             "unresolved.example.com",
         ]
     )
-    assert "dns.example.com  approved  resolved  unreachable  -  -  -  -  dns_resolved" in rows
-    assert "http.example.com  approved  resolved  reachable  200  -  -  -  http_reachable" in rows
-    assert "pending.example.com  pending  pending  pending  -  -  -  -  pending" in rows
+    assert "dns.example.com  approved  resolved  unreachable  -  -  -  -  0  dns_resolved" in rows
+    assert (
+        "http.example.com  approved  resolved  reachable  200  -  -  -  0  http_reachable" in rows
+    )
+    assert "pending.example.com  pending  pending  pending  -  -  -  -  0  pending" in rows
     assert (
         "ports.example.com  approved  resolved  reachable  403  Safe Title  nginx,React  "
-        "80,443,8443  ports_observed"
+        "80,443,8443  0  ports_observed"
     ) in rows
-    assert "rejected.example.com  rejected  pending  pending  -  -  -  -  pending" in rows
-    assert "unresolved.example.com  approved  unresolved  pending  -  -  -  -  pending" in rows
+    assert "rejected.example.com  rejected  pending  pending  -  -  -  -  0  pending" in rows
+    assert "unresolved.example.com  approved  unresolved  pending  -  -  -  -  0  pending" in rows
     assert not Path(".bb/programs/test-program/runs/1/surface").exists()
     for forbidden in (
         "192.0.2.",
@@ -356,6 +358,7 @@ def test_surface_export_is_safe_deterministic_atomic_and_side_effect_free(
         "http_title",
         "http_technologies",
         "open_ports",
+        "path_count",
         "stage",
     }
     assert [payload["host"] for payload in payloads] == sorted(
@@ -373,6 +376,7 @@ def test_surface_export_is_safe_deterministic_atomic_and_side_effect_free(
         "http_technologies": ["nginx", "React"],
         "http_title": "Safe Title",
         "open_ports": [80, 443, 8443],
+        "path_count": 0,
         "stage": "ports_observed",
     }
     assert by_host["pending.example.com"]["dns_status"] == "pending"

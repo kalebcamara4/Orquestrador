@@ -227,7 +227,7 @@ def test_dns_confirm_uses_only_approved_hosts_and_persists_minimal_results(
     ]
     assert snapshots[0].snapshot == {
         "name": "conservative",
-        "version": "1",
+        "version": "2",
         "parameters": {
             "threads": 5,
             "rate_limit_per_second": 5,

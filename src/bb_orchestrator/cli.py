@@ -36,17 +36,20 @@ from bb_orchestrator.services import (
     InputError,
     approve_candidates,
     build_surface_map,
+    crawl_with_katana,
     export_assets,
     export_surface_map,
     import_scope_file,
     ingest_jsonl,
     list_assets_with_dns,
     list_candidates,
+    list_crawl_paths,
     list_open_ports,
     list_queue,
     passive_recon_roots,
     plan_dns_verification,
     plan_http_verification,
+    plan_katana_crawl,
     plan_port_verification,
     prepare_triage,
     reject_candidates,
@@ -69,6 +72,8 @@ program_app = typer.Typer(help="Gerencia programas isolados.")
 policy_app = typer.Typer(help="Gerencia políticas tipadas do programa ativo.")
 ports_app = typer.Typer(help="Consulta portas abertas verificadas com segurança.")
 surface_app = typer.Typer(help="Consolida localmente DNS, HTTP e portas por host.")
+crawl_app = typer.Typer(help="Executa descoberta pública estritamente limitada.")
+paths_app = typer.Typer(help="Consulta caminhos públicos sanitizados.")
 app.add_typer(scope_app, name="scope")
 app.add_typer(run_app, name="run")
 app.add_typer(queue_app, name="queue")
@@ -80,6 +85,8 @@ app.add_typer(program_app, name="program")
 app.add_typer(policy_app, name="policy")
 app.add_typer(ports_app, name="ports")
 app.add_typer(surface_app, name="surface")
+app.add_typer(crawl_app, name="crawl")
+app.add_typer(paths_app, name="paths")
 
 InputFile = Annotated[
     Path,
@@ -232,6 +239,19 @@ def policy_show() -> None:
         f"timeout={policy.ports.timeout_milliseconds}ms; retries={policy.ports.retries}; "
         f"portas={','.join(str(port) for port in policy.ports.ports)}; "
         f"tipo={policy.ports.scan_type}"
+    )
+    typer.echo(
+        "Katana: "
+        f"modo={policy.katana.mode}; headless={str(policy.katana.headless).lower()}; "
+        f"javascript={str(policy.katana.javascript).lower()}; "
+        f"concorrência={policy.katana.concurrency}; "
+        f"paralelismo={policy.katana.parallelism}; "
+        f"req/s={policy.katana.rate_limit_per_second}; depth={policy.katana.depth}; "
+        f"timeout={policy.katana.timeout_seconds}s; retries={policy.katana.retries}; "
+        f"duração-máxima={policy.katana.max_duration_seconds}s; "
+        f"resposta-máxima={policy.katana.max_response_read_bytes} bytes; "
+        f"paths/host={policy.katana.max_paths_per_host}; escopo={policy.katana.scope}; "
+        f"saída={policy.katana.output_field}; métodos={','.join(policy.katana.methods)}"
     )
 
 
@@ -581,6 +601,91 @@ def ports_list(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
         typer.echo(f"{port.host}  {port.port}  {port.status}")
 
 
+@crawl_app.command("katana")
+def crawl_katana_command(
+    run_id: Annotated[int, typer.Argument(min=1)],
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Mostra o plano sem PATH, arquivo, processo ou rede."),
+    ] = False,
+    confirm: Annotated[
+        bool,
+        typer.Option("--confirm", help="Autoriza o crawl público limitado do Katana."),
+    ] = False,
+) -> None:
+    """Descobre paths públicos em aprovados, resolvidos e HTTP alcançáveis."""
+    session, program = _program_session()
+    with session:
+        if dry_run == confirm:
+            _abort("informe exatamente uma opção: --dry-run ou --confirm")
+        try:
+            if dry_run:
+                plan = plan_katana_crawl(
+                    run_id,
+                    session,
+                    program_slug=program.slug,
+                    runs_path=program.runs_path,
+                )
+                typer.echo(f"Política: {plan.policy_name}")
+                typer.echo(f"Versão da política: {plan.policy_version}")
+                typer.echo(f"Hosts elegíveis: {plan.host_count}")
+                typer.echo(
+                    "Parâmetros efetivos: "
+                    f"modo={plan.parameters.mode}; headless=false; javascript=false; "
+                    f"concorrência={plan.parameters.concurrency}; "
+                    f"paralelismo={plan.parameters.parallelism}; "
+                    f"req/s={plan.parameters.rate_limit_per_second}; "
+                    f"depth={plan.parameters.depth}; timeout={plan.parameters.timeout_seconds}s; "
+                    f"retries={plan.parameters.retries}; "
+                    f"duração-máxima={plan.parameters.max_duration_seconds}s; "
+                    f"resposta-máxima={plan.parameters.max_response_read_bytes} bytes; "
+                    f"paths/host={plan.parameters.max_paths_per_host}; "
+                    f"escopo={plan.parameters.scope}; saída={plan.parameters.output_field}; "
+                    f"métodos={','.join(plan.parameters.methods)}"
+                )
+                typer.echo(f"Comando por host planejado: {shlex.join(plan.command)}")
+                if plan.skipped_without_scheme:
+                    typer.echo(
+                        f"Ignorados sem esquema HTTP sanitizado: {plan.skipped_without_scheme}. "
+                        f"Execute bb verify http {run_id} --confirm para atualizá-los."
+                    )
+                return
+            result = crawl_with_katana(
+                run_id,
+                session,
+                program_slug=program.slug,
+                runs_path=program.runs_path,
+            )
+        except InputError as exc:
+            _abort(str(exc))
+    typer.echo(
+        f"Run {run_id}: hosts processados={result.attempted}, "
+        f"caminhos sanitizados={result.observed_paths}."
+    )
+    if result.skipped_without_scheme:
+        typer.echo(
+            f"Ignorados sem esquema HTTP sanitizado: {result.skipped_without_scheme}. "
+            f"Execute bb verify http {run_id} --confirm para atualizá-los."
+        )
+    typer.echo(f"Caminhos: {result.output_path}")
+
+
+@paths_app.command("list")
+def paths_list(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
+    """Lista somente host, path e origem da run no programa ativo."""
+    with _session(announce=False) as session:
+        try:
+            paths = list_crawl_paths(run_id, session)
+        except InputError as exc:
+            _abort(str(exc))
+    if not paths:
+        typer.echo("Nenhum caminho sanitizado.")
+        return
+    typer.echo("HOST  PATH  SOURCE")
+    for path in paths:
+        typer.echo(f"{path.host}  {path.path}  {path.source}")
+
+
 @surface_app.command("list")
 def surface_list(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
     """Mostra a superfície consolidada sem subprocesso, arquivo ou rede."""
@@ -593,7 +698,7 @@ def surface_list(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
     if not records:
         typer.echo("Nenhum candidato nesta run.")
         return
-    typer.echo("HOST  APROVAÇÃO  DNS  HTTP  STATUS  TÍTULO  TECNOLOGIAS  PORTAS  ESTÁGIO")
+    typer.echo("HOST  APROVAÇÃO  DNS  HTTP  STATUS  TÍTULO  TECNOLOGIAS  PORTAS  CAMINHOS  ESTÁGIO")
     for record in records:
         status_code = str(record.http_status_code) if record.http_status_code is not None else "-"
         title = record.http_title or "-"
@@ -602,7 +707,7 @@ def surface_list(run_id: Annotated[int, typer.Argument(min=1)]) -> None:
         typer.echo(
             f"{record.host}  {record.approval_status.value}  {record.dns_status.value}  "
             f"{record.http_reachability.value}  {status_code}  {title}  {technologies}  "
-            f"{ports}  {record.stage.value}"
+            f"{ports}  {record.path_count}  {record.stage.value}"
         )
 
 
