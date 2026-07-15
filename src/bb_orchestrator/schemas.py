@@ -18,6 +18,11 @@ from pydantic import (
 )
 
 from bb_orchestrator.domain import ScopeKind, normalize_domain, parse_scope_pattern
+from bb_orchestrator.triage_selection import (
+    MAX_SELECTED_PATHS,
+    RouteSelectionPolicyName,
+    select_triage_paths,
+)
 
 
 def utc_now() -> datetime:
@@ -179,8 +184,13 @@ class TriageAsset(TriageSchema):
     status: StrictInt | None = Field(ge=100, le=599)
     title: StrictStr | None = Field(max_length=500)
     technologies: list[StrictStr] = Field(max_length=50)
-    paths: list[Annotated[StrictStr, Field(min_length=1, max_length=512)]] = Field(max_length=50)
+    paths: list[Annotated[StrictStr, Field(min_length=1, max_length=512)]] = Field(
+        max_length=MAX_SELECTED_PATHS
+    )
     paths_total: StrictInt = Field(ge=0)
+    paths_included: StrictInt = Field(ge=0, le=MAX_SELECTED_PATHS)
+    paths_omitted_by_policy: StrictInt = Field(ge=0)
+    paths_omitted_by_limit: StrictInt = Field(ge=0)
 
     @field_validator("host")
     @classmethod
@@ -190,8 +200,8 @@ class TriageAsset(TriageSchema):
     @field_validator("paths")
     @classmethod
     def validate_paths(cls, value: list[str]) -> list[str]:
-        if value != sorted(set(value)):
-            raise ValueError("paths devem ser únicos e ordenados")
+        if len(value) != len(set(value)):
+            raise ValueError("paths devem ser únicos")
         for path in value:
             if not path.startswith("/") or path.startswith("//"):
                 raise ValueError("path relativo inválido")
@@ -199,22 +209,26 @@ class TriageAsset(TriageSchema):
                 raise ValueError("query string ou fragmento não permitido")
             if any(unicodedata.category(character).startswith("C") for character in path):
                 raise ValueError("caractere de controle não permitido")
+        selection = select_triage_paths(value)
+        if list(selection.paths) != value or selection.paths_omitted_by_policy:
+            raise ValueError("paths não correspondem à ordenação da política de seleção")
         return value
 
     @model_validator(mode="after")
-    def validate_paths_total(self) -> TriageAsset:
-        included = len(self.paths)
-        if self.paths_total < included:
-            raise ValueError("paths_total não pode ser menor que paths")
-        if self.paths_total <= 50 and self.paths_total != included:
-            raise ValueError("paths_total deve corresponder aos paths incluídos")
-        if self.paths_total > 50 and included != 50:
-            raise ValueError("assets truncados devem conter exatamente 50 paths")
+    def validate_path_counts(self) -> TriageAsset:
+        if self.paths_included != len(self.paths):
+            raise ValueError("paths_included deve corresponder aos paths incluídos")
+        accounted_paths = (
+            self.paths_included + self.paths_omitted_by_policy + self.paths_omitted_by_limit
+        )
+        if self.paths_total != accounted_paths:
+            raise ValueError("os contadores de paths devem corresponder a paths_total")
         return self
 
 
 class _TriageItems(TriageSchema):
     batch_id: StrictStr = Field(min_length=1, max_length=80)
+    selection_policy: RouteSelectionPolicyName
     items: list[TriageAsset] = Field(min_length=1, max_length=20)
 
     @model_validator(mode="after")

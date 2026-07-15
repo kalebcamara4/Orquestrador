@@ -66,10 +66,15 @@ from bb_orchestrator.schemas import (
     TriageBatch,
     TriageRequest,
 )
+from bb_orchestrator.triage_selection import (
+    MAX_SELECTED_PATHS,
+    ROUTE_SELECTION_POLICY,
+    select_triage_paths,
+)
 
 DEFAULT_TRIAGE_BATCH_SIZE = 10
 MAX_TRIAGE_BATCH_SIZE = 20
-MAX_TRIAGE_PATHS_PER_ASSET = 50
+MAX_TRIAGE_PATHS_PER_ASSET = MAX_SELECTED_PATHS
 DEFAULT_RUNS_PATH = Path("runs")
 SUBFINDER_TIMEOUT_SECONDS = 300
 HTTP_TITLE_MAX_LENGTH = 200
@@ -97,6 +102,10 @@ _RAW_HTTP_PATTERN = re.compile(
 _SENSITIVE_PATTERN = re.compile(
     r"(?i)\b(?:authorization|bearer|cookie|set-cookie|token|api[-_ ]?key|secret|"
     r"password|passwd|session[-_ ]?(?:id|token)?|private[-_ ]?key)\b"
+)
+_PATH_SENSITIVE_PATTERN = re.compile(
+    r"(?i)\b(?:authorization|bearer|cookie|set-cookie|token|api[-_ ]?key|secret|"
+    r"session[-_ ]?(?:id|token)?|private[-_ ]?key)\b"
 )
 _SECRET_VALUE_PATTERN = re.compile(
     r"(?i)(?:\beyJ[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+\b|"
@@ -138,8 +147,15 @@ _PATH_HOSTNAME_PATTERN = re.compile(
 )
 _PATH_FILE_EXTENSIONS = frozenset(
     {
+        "7z",
+        "aspx",
+        "avif",
+        "bmp",
         "css",
+        "do",
+        "eot",
         "gif",
+        "gz",
         "htm",
         "html",
         "ico",
@@ -147,13 +163,35 @@ _PATH_FILE_EXTENSIONS = frozenset(
         "jpg",
         "js",
         "json",
+        "jsp",
         "map",
+        "mkv",
+        "mov",
+        "mp3",
+        "mp4",
+        "ogg",
+        "otf",
         "pdf",
+        "php",
         "png",
+        "rar",
         "svg",
+        "tar",
+        "tgz",
+        "tif",
+        "tiff",
         "txt",
+        "ttf",
+        "wav",
+        "webm",
+        "webmanifest",
         "webp",
+        "woff",
+        "woff2",
         "xml",
+        "yaml",
+        "yml",
+        "zip",
     }
 )
 
@@ -177,10 +215,21 @@ class SanitizeResult:
 @dataclass(frozen=True)
 class TriagePreparationResult:
     item_count: int
-    included_paths: int
-    omitted_paths: int
+    paths_included: int
+    paths_omitted_by_policy: int
+    paths_omitted_by_limit: int
     batch_count: int
     paths: tuple[Path, ...]
+
+    @property
+    def included_paths(self) -> int:
+        """Alias de compatibilidade para o contador de paths incluídos."""
+        return self.paths_included
+
+    @property
+    def omitted_paths(self) -> int:
+        """Total omitido, mantido como conveniência para chamadores locais antigos."""
+        return self.paths_omitted_by_policy + self.paths_omitted_by_limit
 
 
 @dataclass(frozen=True)
@@ -1920,7 +1969,7 @@ def _sanitize_crawl_path(value: str) -> str | None:
     normalized = posixpath.normpath(without_query)
     if not normalized.startswith("/") or normalized.startswith("//") or len(normalized) > 512:
         return None
-    if _contains_hostname_path(normalized) or _forbidden_reason(normalized) is not None:
+    if _contains_hostname_path(normalized) or _forbidden_path_reason(normalized) is not None:
         return None
     return normalized
 
@@ -2376,6 +2425,27 @@ def _forbidden_reason(value: str) -> str | None:
     return None
 
 
+def _forbidden_path_reason(value: str) -> str | None:
+    """Aplica os bloqueios de dados a paths sem confundir nomes de rotas com segredos."""
+    checks = (
+        (_URL_PATTERN, "URL completa"),
+        (_QUERY_PATTERN, "query string"),
+        (_PORT_PATTERN, "porta"),
+        (_RAW_HTTP_PATTERN, "header ou conteúdo HTTP bruto"),
+        (_PATH_SENSITIVE_PATTERN, "dado sensível"),
+        (_SECRET_VALUE_PATTERN, "token ou chave"),
+        (_EMAIL_PATTERN, "PII"),
+        (_PHONE_PATTERN, "PII"),
+        (_CPF_PATTERN, "PII"),
+    )
+    for pattern, reason in checks:
+        if pattern.search(value):
+            return reason
+    if _contains_ip_address(value):
+        return "endereço IP"
+    return None
+
+
 def _iter_string_values(value: Any, path: str = "$"):
     if isinstance(value, dict):
         for key, child in value.items():
@@ -2422,7 +2492,11 @@ def enforce_triage_policy(serialized: str) -> None:
                 )
 
     for field_path, value in _iter_string_values(payload):
-        reason = _forbidden_reason(value)
+        reason = (
+            _forbidden_path_reason(value)
+            if re.fullmatch(r"\$\.items\[\d+\]\.paths\[\d+\]", field_path)
+            else _forbidden_reason(value)
+        )
         if reason is not None:
             raise PolicyViolation(f"policy gate recusou {reason} no campo permitido {field_path}")
 
@@ -2633,7 +2707,7 @@ def prepare_triage(
                 latest_http.get(candidate_id),
                 expected_host=host,
             )
-            all_paths = triage_paths[host]
+            selection = select_triage_paths(triage_paths[host])
             triage_assets.append(
                 TriageAsset(
                     asset_id=_stable_asset_id(host),
@@ -2641,8 +2715,11 @@ def prepare_triage(
                     status=status,
                     title=title,
                     technologies=technologies,
-                    paths=all_paths[:MAX_TRIAGE_PATHS_PER_ASSET],
-                    paths_total=len(all_paths),
+                    paths=list(selection.paths),
+                    paths_total=selection.paths_total,
+                    paths_included=selection.paths_included,
+                    paths_omitted_by_policy=selection.paths_omitted_by_policy,
+                    paths_omitted_by_limit=selection.paths_omitted_by_limit,
                 )
             )
     except PolicyViolation:
@@ -2660,6 +2737,7 @@ def prepare_triage(
         batch_id = f"{offset // batch_size + 1:04d}"
         batch = TriageBatch(
             batch_id=batch_id,
+            selection_policy=ROUTE_SELECTION_POLICY,
             items=triage_assets[offset : offset + batch_size],
         )
         request = TriageRequest.model_validate(batch.model_dump(mode="json"))
@@ -2668,12 +2746,11 @@ def prepare_triage(
         serialized_batches.append((batch_id, serialized))
 
     paths = _write_triage_batches(run_id, serialized_batches, runs_path)
-    included_paths = sum(len(asset.paths) for asset in triage_assets)
-    total_paths = sum(asset.paths_total for asset in triage_assets)
     return TriagePreparationResult(
         item_count=len(triage_assets),
-        included_paths=included_paths,
-        omitted_paths=total_paths - included_paths,
+        paths_included=sum(asset.paths_included for asset in triage_assets),
+        paths_omitted_by_policy=sum(asset.paths_omitted_by_policy for asset in triage_assets),
+        paths_omitted_by_limit=sum(asset.paths_omitted_by_limit for asset in triage_assets),
         batch_count=len(serialized_batches),
         paths=paths,
     )

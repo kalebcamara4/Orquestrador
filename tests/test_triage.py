@@ -268,9 +268,13 @@ def test_triage_uses_sanitized_sqlite_surface_and_ignores_paths_artifact(
         "technologies": ["nginx", "React"],
         "paths": ["/", "/api/v1/users", "/login"],
         "paths_total": 3,
+        "paths_included": 3,
+        "paths_omitted_by_policy": 0,
+        "paths_omitted_by_limit": 0,
     }
     assert by_host["without-crawl.example.com"]["paths"] == []
     assert by_host["without-crawl.example.com"]["paths_total"] == 0
+    assert payload["selection_policy"] == "route-priority-v1"
     assert "/artifact-only" not in result.paths[0].read_text()
 
 
@@ -284,7 +288,112 @@ def test_triage_limits_paths_to_fifty_and_counts_omitted(tmp_path: Path, session
 
     assert item["paths"] == [f"/path/{index:03d}" for index in range(50)]
     assert item["paths_total"] == 60
-    assert (result.included_paths, result.omitted_paths) == (50, 10)
+    assert item["paths_included"] == 50
+    assert item["paths_omitted_by_policy"] == 0
+    assert item["paths_omitted_by_limit"] == 10
+    assert (
+        result.included_paths,
+        result.paths_omitted_by_policy,
+        result.paths_omitted_by_limit,
+    ) == (50, 0, 10)
+
+
+def test_triage_prioritizes_routes_without_changing_the_complete_inventory(
+    tmp_path: Path,
+    session,
+) -> None:
+    run = _add_run(session, ["shop.example.com"])
+    inventory = [
+        "/media/menu.css",
+        "/minha-conta",
+        "/meu-pedido",
+        "/media/theme.css",
+        "/meus-pedidos",
+        "/promocoes",
+        "/cardapio",
+        "/area-de-entrega",
+        "/assets/application.js",
+        "/",
+    ]
+    _add_paths(session, run.id, "shop.example.com", inventory)
+    artifact = tmp_path / "runs" / str(run.id) / "crawl" / "paths.jsonl"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("inventário completo preservado\n", encoding="utf-8")
+    rows_before = tuple(
+        session.execute(
+            select(CrawlPathModel.host, CrawlPathModel.path)
+            .where(CrawlPathModel.run_id == run.id)
+            .order_by(CrawlPathModel.id)
+        ).all()
+    )
+
+    result = prepare_triage(run.id, session, runs_path=tmp_path / "runs")
+    payload = json.loads(result.paths[0].read_text())
+    item = payload["items"][0]
+
+    assert payload["selection_policy"] == "route-priority-v1"
+    assert item["paths"] == [
+        "/",
+        "/meu-pedido",
+        "/meus-pedidos",
+        "/promocoes",
+        "/area-de-entrega",
+        "/cardapio",
+        "/minha-conta",
+        "/assets/application.js",
+    ]
+    assert (
+        item["paths_total"],
+        item["paths_included"],
+        item["paths_omitted_by_policy"],
+        item["paths_omitted_by_limit"],
+    ) == (10, 8, 2, 0)
+    assert artifact.read_text(encoding="utf-8") == "inventário completo preservado\n"
+    assert (
+        tuple(
+            session.execute(
+                select(CrawlPathModel.host, CrawlPathModel.path)
+                .where(CrawlPathModel.run_id == run.id)
+                .order_by(CrawlPathModel.id)
+            ).all()
+        )
+        == rows_before
+    )
+
+
+def test_triage_accepts_recognized_dynamic_file_extensions(tmp_path: Path, session) -> None:
+    run = _add_run(session, ["legacy.example.com"])
+    _add_paths(
+        session,
+        run.id,
+        "legacy.example.com",
+        ["/action.do", "/index.php", "/login.aspx", "/view.jsp"],
+    )
+
+    result = prepare_triage(run.id, session, runs_path=tmp_path / "runs")
+    item = json.loads(result.paths[0].read_text())["items"][0]
+
+    assert item["paths"] == ["/action.do", "/index.php", "/login.aspx", "/view.jsp"]
+    assert item["paths_included"] == item["paths_total"] == 4
+
+
+def test_triage_allows_password_as_a_route_segment_without_secret_data(
+    tmp_path: Path,
+    session,
+) -> None:
+    run = _add_run(session, ["accounts.example.com"])
+    _add_paths(
+        session,
+        run.id,
+        "accounts.example.com",
+        ["/reset/password", "/password/reset"],
+    )
+
+    result = prepare_triage(run.id, session, runs_path=tmp_path / "runs")
+    item = json.loads(result.paths[0].read_text())["items"][0]
+
+    assert item["paths"] == ["/password/reset", "/reset/password"]
+    assert item["paths_omitted_by_policy"] == item["paths_omitted_by_limit"] == 0
 
 
 @pytest.mark.parametrize(
@@ -372,6 +481,9 @@ def test_triage_schemas_refuse_extra_fields_and_invalid_response_values() -> Non
         "technologies": [],
         "paths": [],
         "paths_total": 0,
+        "paths_included": 0,
+        "paths_omitted_by_policy": 0,
+        "paths_omitted_by_limit": 0,
     }
     with pytest.raises(ValidationError):
         TriageAsset.model_validate({**item, "url": "https://example.com"})
@@ -382,12 +494,35 @@ def test_triage_schemas_refuse_extra_fields_and_invalid_response_values() -> Non
             {key: value for key, value in item.items() if key != "paths_total"}
         )
     with pytest.raises(ValidationError):
-        TriageAsset.model_validate({**item, "paths": ["/login"], "paths_total": 0})
+        TriageAsset.model_validate(
+            {key: value for key, value in item.items() if key != "paths_included"}
+        )
     with pytest.raises(ValidationError):
-        TriageAsset.model_validate({**item, "paths": ["/z", "/a"], "paths_total": 2})
+        TriageAsset.model_validate(
+            {**item, "paths": ["/login"], "paths_total": 0, "paths_included": 1}
+        )
+    with pytest.raises(ValidationError):
+        TriageAsset.model_validate(
+            {**item, "paths": ["/z", "/a"], "paths_total": 2, "paths_included": 2}
+        )
     with pytest.raises(ValidationError):
         TriageRequest.model_validate(
-            {"batch_id": "0001", "items": [item], "headers": {"X-Test": "value"}}
+            {
+                "batch_id": "0001",
+                "selection_policy": "route-priority-v1",
+                "items": [item],
+                "headers": {"X-Test": "value"},
+            }
+        )
+    with pytest.raises(ValidationError):
+        TriageRequest.model_validate({"batch_id": "0001", "items": [item]})
+    with pytest.raises(ValidationError):
+        TriageRequest.model_validate(
+            {
+                "batch_id": "0001",
+                "selection_policy": "conservative",
+                "items": [item],
+            }
         )
     with pytest.raises(ValidationError):
         TriageDecision.model_validate(
@@ -440,6 +575,7 @@ def test_triage_schemas_refuse_extra_fields_and_invalid_response_values() -> Non
 def test_policy_gate_blocks_prohibited_patterns(forbidden_value: str) -> None:
     payload = {
         "batch_id": "0001",
+        "selection_policy": "route-priority-v1",
         "items": [
             {
                 "asset_id": "asset-1",
@@ -449,6 +585,9 @@ def test_policy_gate_blocks_prohibited_patterns(forbidden_value: str) -> None:
                 "technologies": [],
                 "paths": [],
                 "paths_total": 0,
+                "paths_included": 0,
+                "paths_omitted_by_policy": 0,
+                "paths_omitted_by_limit": 0,
             }
         ],
     }
@@ -473,6 +612,7 @@ def test_policy_gate_blocks_prohibited_patterns(forbidden_value: str) -> None:
 def test_policy_gate_blocks_prohibited_paths(forbidden_path: str) -> None:
     payload = {
         "batch_id": "0001",
+        "selection_policy": "route-priority-v1",
         "items": [
             {
                 "asset_id": "asset-1",
@@ -482,6 +622,9 @@ def test_policy_gate_blocks_prohibited_paths(forbidden_path: str) -> None:
                 "technologies": [],
                 "paths": [forbidden_path],
                 "paths_total": 1,
+                "paths_included": 1,
+                "paths_omitted_by_policy": 0,
+                "paths_omitted_by_limit": 0,
             }
         ],
     }
@@ -493,6 +636,7 @@ def test_policy_gate_blocks_prohibited_paths(forbidden_path: str) -> None:
 def test_policy_gate_blocks_extra_fields_in_serialized_json() -> None:
     payload = {
         "batch_id": "0001",
+        "selection_policy": "route-priority-v1",
         "items": [
             {
                 "asset_id": "asset-1",
@@ -502,6 +646,9 @@ def test_policy_gate_blocks_extra_fields_in_serialized_json() -> None:
                 "technologies": [],
                 "paths": [],
                 "paths_total": 0,
+                "paths_included": 0,
+                "paths_omitted_by_policy": 0,
+                "paths_omitted_by_limit": 0,
                 "body": "raw HTTP body",
             }
         ],
@@ -731,10 +878,14 @@ def test_cli_dry_run_end_to_end(tmp_path: Path, monkeypatch) -> None:
     result = runner.invoke(app, ["triage", "1", "--dry-run"], env=env)
 
     assert result.exit_code == 0, result.output
-    assert "assets=2, paths incluídos=0, paths omitidos=0, lotes=1" in result.output
+    assert (
+        "assets=2, paths incluídos=0, paths omitidos por política=0, "
+        "paths omitidos por limite=0, lotes=1"
+    ) in result.output
     output_path = tmp_path / ".bb/programs/test-program/runs/1/llm/triage-input-0001.json"
     payload = json.loads(output_path.read_text())
     assert len(payload["items"]) == 2
+    assert payload["selection_policy"] == "route-priority-v1"
     assert set(payload["items"][0]) == {
         "asset_id",
         "host",
@@ -743,6 +894,9 @@ def test_cli_dry_run_end_to_end(tmp_path: Path, monkeypatch) -> None:
         "technologies",
         "paths",
         "paths_total",
+        "paths_included",
+        "paths_omitted_by_policy",
+        "paths_omitted_by_limit",
     }
 
 

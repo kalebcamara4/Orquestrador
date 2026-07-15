@@ -516,33 +516,53 @@ preparação usa o último status HTTP, título e tecnologias já sanitizados e 
 `crawl_paths` da mesma run e host. O arquivo `crawl/paths.jsonl` nunca é lido pela triagem; ele
 continua sendo somente um artefato de exportação.
 
-Cada item possui um `asset_id` derivado deterministicamente do host canônico e contém somente a
-allowlist abaixo:
+Cada arquivo declara no envelope a política local versionada `route-priority-v1`. Ela é uma
+política de seleção de contexto, independente da política de execução `conservative`; não cria nem
+altera snapshots de execução. Cada item possui um `asset_id` derivado deterministicamente do host
+canônico e contém somente a allowlist abaixo:
 
 ```json
 {
-  "asset_id": "asset-<sha256>",
-  "host": "api.example.com",
-  "status": 200,
-  "title": "Safe Title",
-  "technologies": ["nginx", "React"],
-  "paths": ["/", "/api/v1/users", "/login"],
-  "paths_total": 3
+  "batch_id": "0001",
+  "selection_policy": "route-priority-v1",
+  "items": [
+    {
+      "asset_id": "asset-<sha256>",
+      "host": "api.example.com",
+      "status": 200,
+      "title": "Safe Title",
+      "technologies": ["nginx", "React"],
+      "paths": ["/", "/api/v1/users", "/login"],
+      "paths_total": 3,
+      "paths_included": 3,
+      "paths_omitted_by_policy": 0,
+      "paths_omitted_by_limit": 0
+    }
+  ]
 }
 ```
 
-Os paths são normalizados, deduplicados e ordenados. Cada item inclui no máximo os primeiros 50;
-`paths_total` informa o total seguro persistido para o asset. Assim, quando `paths_total` for 60,
-o lote terá 50 paths e a CLI contará 10 como omitidos pelo limite de contexto. Assets sem crawl
-mantêm `paths: []` e `paths_total: 0`.
+`route-priority-v1` deduplica os paths antes de classificá-los e desempata cada categoria pelo path
+normalizado em ordem lexicográfica. A ordem é: raiz `/`; rotas com segmentos explícitos de
+aplicação, identidade ou API; documentação de API e arquivos dinâmicos reconhecidos; paths sem
+extensão final; e até cinco referências JavaScript próprias do host. CSS, imagens, fontes,
+manifestos, source maps, arquivos compactados, bibliotecas e minificados evidentes não entram no
+lote. Paths estáticos nunca são usados apenas para completar 50 itens, e nenhum JavaScript é
+baixado ou interpretado nesta etapa.
+
+Cada asset inclui no máximo 50 paths. `paths_total` informa o total sanitizado e deduplicado no
+SQLite; `paths_included` informa quantos foram enviados; `paths_omitted_by_policy` conta paths
+estáticos ou irrelevantes; e `paths_omitted_by_limit` conta os elegíveis que excederam 50. A CLI
+exibe os totais dessas três últimas contagens. Assets sem crawl mantêm os quatro contadores em zero
+e `paths: []`. Todos os registros continuam preservados em `crawl_paths` e em `paths.jsonl`.
 
 O JSON final passa por um policy gate default-deny antes da gravação. Campos extras, URLs, query
 strings, fragmentos, hosts, IPs, portas, credenciais, headers, corpo HTTP, cookies, tokens, chaves,
 e-mails, telefones, controles e PII fazem a preparação inteira falhar antes de qualquer lote ser
 gravado. Uma run inexistente ou sem itens sanitizados e pendentes também falha sem criar lotes.
 
-Paths são evidências de superfície pública observada. Eles não representam vulnerabilidades, não
-confirmam autorização ou acesso a conteúdo e não constituem PoC.
+A seleção serve somente para reduzir contexto. As categorias não representam severidade, não
+afirmam vulnerabilidade, não confirmam autorização ou acesso a conteúdo e não constituem PoC.
 
 O schema estrito reservado para uma futura resposta é:
 

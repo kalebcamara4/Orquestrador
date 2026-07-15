@@ -772,8 +772,10 @@ def triage(
         except InputError as exc:
             _abort(str(exc))
     typer.echo(
-        f"Run {run_id}: assets={result.item_count}, paths incluídos={result.included_paths}, "
-        f"paths omitidos={result.omitted_paths}, lotes={result.batch_count}; "
+        f"Run {run_id}: assets={result.item_count}, paths incluídos={result.paths_included}, "
+        f"paths omitidos por política={result.paths_omitted_by_policy}, "
+        f"paths omitidos por limite={result.paths_omitted_by_limit}, "
+        f"lotes={result.batch_count}; "
         f"arquivos em {program.runs_path}/{run_id}/llm/."
     )
 
